@@ -1,17 +1,3 @@
-"""
-main.py
-=======
-Entry point for the competition evaluation. Loads the trained digit CNN,
-processes every PNG in --input-dir through preprocessing.py + model.py, and
-writes a CSV of (filename, predicted_code) to --output-dir.
-
-Usage:
-    python main.py --input-dir /path/to/input --output-dir /path/to/output
-
-Required alongside this file: preprocessing.py, model.py, and the trained
-checkpoint (digit_cnn.pt) in the same directory (or pass --checkpoint).
-"""
-
 from __future__ import annotations
 
 import argparse

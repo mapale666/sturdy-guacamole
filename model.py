@@ -1,23 +1,3 @@
-"""
-model.py
-========
-Lightweight CNN for single-digit classification (0-9), trained on the
-ground_truth_chars_balanced folder (labels encoded in filenames as
-"<fileid>_<label>.<ext>", e.g. "100016_0.tif" -> label 0), plus inference
-glue that combines it with preprocessing.py to read a full multi-digit
-seal code from a raw seal photo.
-
-IMPORTANT: seal codes in this dataset are 7 digits long (e.g. "1584143"),
-NOT 6. recognize_seal() defaults to n_digits=7 to match.
-
-recognize_seal() is what assembles per-digit predictions into the final
-code string -- that is the function main.py actually calls, not
-predict_digits() directly.
-
-Training:
-    python model.py --chars-dir ground_truth_chars_balanced --out digit_cnn.pt --epochs 25 --device cuda
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -36,7 +16,6 @@ from torch.utils.data import Dataset, DataLoader
 import cv2
 
 import preprocessing as pp
-
 
 IMG_SIZE = 28
 N_CLASSES = 10
@@ -62,7 +41,7 @@ def resolve_device(requested: Optional[str] = None) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Label parsing: "<fileid>_<label>.<ext>" -> label
+# Label parsing: "<id>_<label>.<ext>" -> label
 # --------------------------------------------------------------------------- #
 
 def parse_label_from_filename(filename: str) -> Optional[int]:
@@ -116,7 +95,7 @@ def stratified_split(samples: List[Tuple[str, int]], seed: int = 42,
         train += items[:n_train]
         val += items[n_train:n_train + n_val]
         test += items[n_train + n_val:]
-        print(f"class {label}: total={n}  train={n_train}  val={n_val}  test={n - n_train - n_val}")
+        print(f"class {label}: total={n} train={n_train} val={n_val} test={n - n_train - n_val}")
 
     rng.shuffle(train)
     rng.shuffle(val)
@@ -220,8 +199,12 @@ class CharsDataset(Dataset):
         path = os.path.join(self.chars_dir, fname)
         gray = pp.to_gray(pp.load_image(path))
 
-        binary = pp.robust_binarize(pp.correct_illumination(gray))
-        binary = pp.clean_mask(binary)
+        # FIX: these are already-cropped, tightly-framed single-digit images
+        # (ground_truth_chars_balanced), NOT full seal photos. Use the
+        # isolated-crop path instead of correct_illumination()+robust_binarize()
+        # +clean_mask(), whose large background-blur kernel gets capped to
+        # nearly the whole crop and flattens the digit before thresholding.
+        binary = pp.prepare_isolated_crop(gray)
         canvas = pp.to_classical_canvas(binary, size=IMG_SIZE).astype(np.float32)
 
         if self.train:
@@ -310,8 +293,8 @@ def train_model(chars_dir: str, out_path: str, manifest_dir: Optional[str] = Non
 
         train_acc = train_correct / max(1, train_total)
         val_acc = val_correct / max(1, val_total)
-        print(f"epoch {epoch:03d}  train_loss={train_loss/train_total:.4f} "
-              f"train_acc={train_acc:.4f}  val_loss={val_loss/val_total:.4f} val_acc={val_acc:.4f}")
+        print(f"epoch {epoch:03d} train_loss={train_loss/train_total:.4f} "
+              f"train_acc={train_acc:.4f} val_loss={val_loss/val_total:.4f} val_acc={val_acc:.4f}")
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
@@ -374,13 +357,7 @@ def predict_digits(model: DigitCNN, crops: List[np.ndarray], device: Optional[st
 
 def recognize_seal(model: DigitCNN, image_path: str, n_digits: int = N_DIGITS_DEFAULT,
                     device: Optional[str] = None) -> Optional[str]:
-    """
-    Produces the deliverable: a full multi-digit code string (e.g.
-    "1584143", 7 digits). Localizes the digit row on the whole seal image
-    via preprocessing.py, classifies each crop with the CNN, and joins the
-    results in left-to-right order. Returns None if the digit row couldn't
-    be located at all.
-    """
+
     crops = pp.preprocess_seal(image_path, mode="cnn", n_digits=n_digits)
     if crops is None or len(crops) != n_digits:
         return None

@@ -1,20 +1,3 @@
-"""
-evaluate_pipeline.py
-=====================
-End-to-end evaluation of the FULL seal recognition pipeline (localization +
-digit classification combined) against the train/val/test seal-image
-folders, using the ground-truth codes in splits/split_seals/*.csv.
-
-CSV format confirmed: semicolon-delimited, columns "filename;number".
-Seal codes are 7 digits (e.g. "1584143") -- n_digits defaults to 7.
-
-Usage:
-    python evaluate_pipeline.py \
-        --images-dir val \
-        --labels-csv splits/split_seals/val.csv \
-        --checkpoint digit_cnn.pt
-"""
-
 from __future__ import annotations
 
 import argparse
