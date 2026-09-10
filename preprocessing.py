@@ -28,12 +28,7 @@ def to_gray(bgr: np.ndarray) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 
 def correct_illumination(gray: np.ndarray, blur_ksize: int = 51) -> np.ndarray:
-    """
-    Flattens vignetting / uneven exposure by dividing out a heavily blurred
-    version of the image, then re-normalizes contrast with CLAHE. DO NOT
-    use this on small, already-cropped individual digit images -- see
-    prepare_isolated_crop() instead.
-    """
+
     h, w = gray.shape[:2]
     ksize = min(blur_ksize, max(3, min(h, w) - 1))
     ksize = ksize | 1
@@ -58,10 +53,7 @@ def denoise(gray: np.ndarray, ksize: int = 3) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 
 def robust_binarize(gray: np.ndarray, polarity: str = "area") -> np.ndarray:
-    """
-    Produces a binary image with numeral pixels = 255, background = 0.
-    Tries Otsu first, falls back to adaptive thresholding if degenerate.
-    """
+
     blurred = denoise(gray, 3)
     _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
@@ -83,7 +75,7 @@ def robust_binarize(gray: np.ndarray, polarity: str = "area") -> np.ndarray:
 
 
 def normalize_polarity(binary: np.ndarray) -> np.ndarray:
-    """Forces numeral = foreground = 255, assuming numeral occupies less area."""
+
     fg_ratio = np.count_nonzero(binary) / binary.size
     if fg_ratio > 0.5:
         binary = cv2.bitwise_not(binary)
@@ -130,11 +122,7 @@ def clean_mask(binary: np.ndarray, ksize: int = 3) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 
 def prepare_isolated_crop(gray: np.ndarray) -> np.ndarray:
-    """
-    Binarizes an already-isolated digit crop WITHOUT full-image illumination
-    correction, using its own LOCAL Otsu threshold and border-based
-    polarity.
-    """
+
     h, w = gray.shape[:2]
     denoised = denoise(gray, 3)
     binary = robust_binarize(denoised, polarity="border")
@@ -275,13 +263,7 @@ def _iou(a: Component, b: Component) -> float:
 
 
 def _dedupe_cross_polarity(comps: List[Component], overlap_thresh: float = 0.35) -> List[Component]:
-    """
-    When merging component pools detected under two different
-    binarization polarities, the same physical digit is often picked up
-    by both passes with slightly different bounding boxes. Keeps the
-    higher-fill (cleaner) detection of each overlapping pair rather than
-    treating them as two separate digits.
-    """
+
     def fill_ratio(c: Component) -> float:
         return c.area / float(c.w * c.h) if c.w > 0 and c.h > 0 else 0.0
 
@@ -362,15 +344,7 @@ def _uniform_slice_boxes(extent: Tuple[int, int, int, int],
 
 def _reinforce_weak_group_members(group: List[Component], fill_ratio_drop: float = 0.5,
                                    size_drop: float = 0.55) -> List[Component]:
-    """
-    Any member that's undersized or unusually low-fill relative to the
-    row's median is likely an edge-clipped/partial detection. Its box
-    geometry is replaced with the row's median width/height, and its
-    x-position is re-estimated by extrapolating the pitch established by
-    the GOOD neighboring members -- not by recentering on its own
-    centroid, which is biased toward whichever side of the digit
-    actually got detected before being clipped.
-    """
+
     if len(group) < 2:
         return group
     group_sorted = sorted(group, key=lambda c: c.x)
@@ -429,22 +403,7 @@ def _has_weak_member(group: List[Component], size_drop: float = 0.55,
 def _best_row_group(comps, n_digits, row_tolerance_frac=0.4, prefer_lowest=True,
                      tag_height=None, min_y_frac=0.60, allow_irregular_fallback=True,
                      reject_weak=False):
-    """
-    Given a pool of digit-shaped components (already deduped), clusters
-    them by vertical center (cy) and returns the best-scoring, regular
-    group of n_digits components. Any candidate group whose vertical
-    center sits above the bottom min_y_frac of the tag is rejected
-    outright, even if it scores well -- background/texture noise
-    clusters can look "regular" by chance, but the real numeral row is
-    never that high up. When multiple regular groups exist, prefers the
-    LOWEST one if prefer_lowest is True, matching every verified example.
 
-    If allow_irregular_fallback is False and no properly regular group
-    is found, returns None instead of falling back to the crude
-    "closest median height" heuristic -- letting the caller try smarter
-    gap-interpolation logic instead of accepting a confident-but-wrong
-    guess.
-    """
     if len(comps) < n_digits:
         return None
 
@@ -519,14 +478,7 @@ def _cluster_candidates_by_row(comps: List[Component], min_count: int,
 
 def _ink_density_in_window(binary_masks: Tuple[np.ndarray, np.ndarray],
                             x0: float, x1: float, y0: float, y1: float) -> float:
-    """
-    Measures ink density in a window using the full-tag binary masks
-    (both polarities) that were already correctly binarized with full
-    context -- rather than re-thresholding the tiny window in isolation,
-    which is unreliable on a small, near-uniform patch (Otsu and
-    border-based polarity normalization both need enough context to be
-    trustworthy). Returns the higher of the two polarities' densities.
-    """
+
     best = 0.0
     for binary in binary_masks:
         x0c, x1c = max(0, int(x0)), min(binary.shape[1], int(x1))
@@ -543,20 +495,7 @@ def _ink_density_in_window(binary_masks: Tuple[np.ndarray, np.ndarray],
 def _try_interpolated_group(group: List[Component], n_digits: int,
                              binary_masks: Optional[Tuple[np.ndarray, np.ndarray]] = None
                              ) -> Optional[List[Component]]:
-    """
-    Checks whether a cluster short of n_digits has gaps between its
-    members that are clean integer multiples of a consistent pitch --
-    i.e. the row really is evenly spaced and one or two digits simply
-    failed shape detection at that exact spot (common with local
-    glare/blur). If so, fills the missing slot(s) with interpolated
-    boxes (median size, expected position) rather than forcing in an
-    unrelated noise blob just to hit n_digits.
 
-    If the shortfall is at one of the two ENDS (no internal gap), the
-    side to extend is decided by checking actual ink density in each
-    candidate extension window (via binary_masks) instead of always
-    assuming the missing digit comes after the last detected one.
-    """
     group_sorted = sorted(group, key=lambda c: c.x)
     if len(group_sorted) < max(3, n_digits - 2):
         return None
@@ -621,17 +560,7 @@ def _try_interpolated_group(group: List[Component], n_digits: int,
 # --------------------------------------------------------------------------- #
 
 def _collect_tag_components(tag_crop: np.ndarray) -> Tuple[List[Component], np.ndarray, np.ndarray]:
-    """
-    Binarizes the tag crop under BOTH polarities and merges the
-    shape-filtered digit-like components found in each into one pool.
-    Different digits on the same tag can render more clearly under
-    different polarities (depending on local shadow/highlight from the
-    embossing), so relying on a single polarity's pass can miss digits
-    that the other polarity would have caught cleanly. Also returns the
-    two full-tag binary masks themselves, so gap-interpolation can later
-    check ink density with full context instead of re-binarizing a tiny
-    isolated window.
-    """
+
     corrected = correct_illumination(tag_crop)
     binary_normal = clean_mask(robust_binarize(corrected, polarity="area"))
     binary_inverted = clean_mask(cv2.bitwise_not(robust_binarize(corrected, polarity="area")))
@@ -652,14 +581,7 @@ def _collect_tag_components(tag_crop: np.ndarray) -> Tuple[List[Component], np.n
 # --------------------------------------------------------------------------- #
 
 def _valley_split_row(row_binary: np.ndarray, n_digits: int) -> Optional[List[Tuple[int, int, int, int]]]:
-    """
-    Splits a binary text-row into n_digits boxes using local minima of the
-    column ink-density profile, searched near evenly-spaced expected cut
-    positions. Does not require clean isolated blobs, so it survives
-    touching/merged characters far better than pure connected-component
-    analysis. Returns boxes (x, y, w, h) in row_binary's own coordinate
-    space, or None if the split looks degenerate.
-    """
+
     col_profile = row_binary.sum(axis=0).astype(np.float32) / 255.0
     nz = np.where(col_profile > 0)[0]
     if len(nz) == 0:
@@ -744,12 +666,7 @@ def _find_tag_bbox_attempt(blurred: np.ndarray, img_area: float,
 
 
 def _find_tag_bbox(gray: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
-    """
-    Locates the raised/molded tag plaque via its embossed border contour,
-    which is present regardless of whether the tag's interior is light-
-    on-dark or dark-on-light. Returns (x0, y0, x1, y1) in image
-    coordinates, or None if no suitable contour is found.
-    """
+
     h, w = gray.shape[:2]
     img_area = h * w
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -773,13 +690,7 @@ def _find_tag_bbox(gray: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
 def _find_text_row_bands(binary: np.ndarray, min_frac: float = 0.25,
                           min_band_height_frac: float = 0.04,
                           gap_tol_frac: float = 0.008) -> List[Tuple[int, int]]:
-    """
-    Finds contiguous rows of significant ink density within `binary`
-    (expected to already be restricted to the tag interior). Returns a
-    list of (y0, y1) bands, in ascending y order. Small gaps are merged
-    so a single row of text with minor internal gaps isn't split into
-    multiple fragments.
-    """
+
     h = binary.shape[0]
     row_profile = binary.sum(axis=1).astype(np.float32) / 255.0
     if row_profile.max() <= 0:
@@ -811,12 +722,7 @@ def _find_text_row_bands(binary: np.ndarray, min_frac: float = 0.25,
 
 
 def _row_is_plausible(row_y0: int, row_y1: int, tag_height: int, max_frac: float = 0.45) -> bool:
-    """
-    Guards against accepting a candidate numeral row whose height is an
-    implausibly large fraction of the whole tag -- a sign that band
-    detection accidentally swallowed the brand-name text together with
-    the numeral row.
-    """
+
     if tag_height <= 0:
         return False
     return (row_y1 - row_y0) <= tag_height * max_frac
@@ -827,14 +733,7 @@ def _row_is_plausible(row_y0: int, row_y1: int, tag_height: int, max_frac: float
 # --------------------------------------------------------------------------- #
 
 def _locate_within_tag(gray: np.ndarray, n_digits: int) -> Optional[List[Tuple[int, int, int, int]]]:
-    """
-    Stage 1+3: find the tag, pool digit-shaped components from BOTH
-    binarization polarities, and pick the best REGULAR group of
-    n_digits as the numeral row. Falls back to gap-interpolation for a
-    partial-but-evenly-spaced row, then to the older single-polarity
-    band + valley-split approach, in that order. Returns boxes in
-    ORIGINAL (full-image) coordinates, or None.
-    """
+
     tag_bbox = _find_tag_bbox(gray)
     if tag_bbox is None:
         return None
@@ -849,18 +748,12 @@ def _locate_within_tag(gray: np.ndarray, n_digits: int) -> Optional[List[Tuple[i
         return None
     tag_height = tag_crop.shape[0]
 
-    # --- Primary method: cross-polarity component pooling. A non-regular
-    #     "best guess" is intentionally rejected here (allow_irregular_
-    #     fallback=False) so a confident-but-wrong crude answer doesn't
-    #     preempt the smarter gap-interpolation stage below. ---
     pool, binary_normal, binary_inverted = _collect_tag_components(tag_crop)
     group = _best_row_group(pool, n_digits, prefer_lowest=True, tag_height=tag_height,
                          allow_irregular_fallback=False)
     if group is not None:
         return [(tx0 + c.x, ty0 + c.y, c.w, c.h) for c in group]
 
-    # --- Secondary method: gap interpolation for a partial, evenly-
-    #     spaced row (one or two digits genuinely undetected) ---
     binary_masks = (binary_normal, binary_inverted)
     for min_count in (n_digits - 1, n_digits - 2):
         clusters = _cluster_candidates_by_row(pool, min_count, tag_height=tag_height)
@@ -923,11 +816,7 @@ def _locate_within_tag(gray: np.ndarray, n_digits: int) -> Optional[List[Tuple[i
 
 def _locate_whole_image_fallback(gray: np.ndarray, n_digits: int,
                                   row_tolerance_frac: float = 0.4) -> Optional[List[Tuple[int, int, int, int]]]:
-    """
-    Previous whole-image dual-polarity method, kept as a fallback for
-    photos where tag-boundary detection (Stage 1) fails. This IS the
-    last resort, so allow_irregular_fallback stays at its default True.
-    """
+
     corrected = correct_illumination(gray)
     binary = clean_mask(robust_binarize(corrected))
     binary_inv = clean_mask(cv2.bitwise_not(binary))

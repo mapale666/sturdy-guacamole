@@ -150,13 +150,7 @@ def get_or_create_splits(chars_dir: str, manifest_dir: Optional[str] = None,
 # --------------------------------------------------------------------------- #
 
 def add_speckle_noise(img: np.ndarray, rng: random.Random, max_specks: int = 6) -> np.ndarray:
-    """
-    Lights up a handful of isolated single/few-pixel dots at random
-    locations, mimicking the fine surface-texture speckle noise seen in
-    real seal photos (metal/plastic tag grain) that the clean isolated
-    training scans don't have. Trains the CNN to ignore small unconnected
-    noise blobs rather than being thrown off by them.
-    """
+
     if rng.random() >= 0.4:
         return img
     out = img.copy()
@@ -173,13 +167,6 @@ def add_speckle_noise(img: np.ndarray, rng: random.Random, max_specks: int = 6) 
 
 
 def random_morph(img: np.ndarray, rng: random.Random) -> np.ndarray:
-    """
-    Randomly thins or thickens the digit stroke slightly, mimicking the
-    stroke-width variability introduced by embossing/lighting/thresholding
-    differences between the clean training scans and real photo crops
-    (e.g. a thin "7" corner or the gap separating an "8"'s two loops can
-    come out thicker or thinner depending on real-world exposure).
-    """
     if rng.random() >= 0.4:
         return img
     binary_u8 = (img > 0.5).astype(np.uint8) * 255
@@ -192,11 +179,6 @@ def random_morph(img: np.ndarray, rng: random.Random) -> np.ndarray:
 
 
 def random_erase(img: np.ndarray, rng: random.Random) -> np.ndarray:
-    """
-    Blacks out a small random rectangular patch, mimicking partial glare
-    or occlusion that can wipe out part of a digit's stroke in real
-    photos (e.g. one loop of an "8", or a "7"'s corner going missing).
-    """
     if rng.random() >= 0.25:
         return img
     out = img.copy()
@@ -419,14 +401,6 @@ def predict_digits(model: DigitCNN, crops: List[np.ndarray], device: Optional[st
 
 def recognize_seal(model: DigitCNN, image_path: str, n_digits: int = N_DIGITS_DEFAULT,
                     device: Optional[str] = None) -> Optional[str]:
-    """
-    Produces the deliverable: a full multi-digit code string (e.g.
-    "1584143", 7 digits). Localizes the digit row on the whole seal image
-    via preprocessing.py, classifies each crop with the CNN, and joins the
-    results in left-to-right order. Returns None if the digit row couldn't
-    be located at all. Passes IMG_SIZE through to preprocess_seal() so the
-    canvas size fed to the CNN always matches what it was trained on.
-    """
     crops = pp.preprocess_seal(image_path, mode="cnn", n_digits=n_digits, img_size=IMG_SIZE)
     if crops is None or len(crops) != n_digits:
         return None

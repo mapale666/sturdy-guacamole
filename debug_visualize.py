@@ -1,15 +1,3 @@
-"""
-debug_visualize.py
-===================
-Diagnostic tool: for a given seal image, draws the detected TAG BOUNDARY
-(Stage 1) and the final digit boxes (Stage 3) on top of the original
-photo, saves each extracted per-digit crop, and (--dump-components)
-prints candidate component stats for threshold tuning.
-
-Usage:
-    python debug_visualize.py --image "C:\\path\\to\\val\\00001.png" --out debug_out --n-digits 7 --dump-components
-"""
-
 import argparse
 import os
 
