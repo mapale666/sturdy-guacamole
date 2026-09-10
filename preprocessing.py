@@ -412,11 +412,23 @@ def _reinforce_weak_group_members(group: List[Component], fill_ratio_drop: float
                                int(med_w * med_h * 0.4), new_x + med_w / 2.0, new_y + med_h / 2.0)
     return result
 
-def _best_row_group(comps: List[Component], n_digits: int,
-                     row_tolerance_frac: float = 0.4,
-                     prefer_lowest: bool = True,
-                     tag_height: Optional[int] = None,
-                     min_y_frac: float = 0.60) -> Optional[List[Component]]:
+def _has_weak_member(group: List[Component], size_drop: float = 0.55,
+                      fill_ratio_drop: float = 0.5) -> bool:
+    if len(group) < 2:
+        return False
+    fills = [c.area / float(c.w * c.h) if c.w > 0 and c.h > 0 else 0.0 for c in group]
+    med_fill = float(np.median(fills))
+    med_w = float(np.median([c.w for c in group]))
+    med_h = float(np.median([c.h for c in group]))
+    for i, c in enumerate(group):
+        if c.w < med_w * size_drop or c.h < med_h * size_drop or fills[i] < med_fill * fill_ratio_drop:
+            return True
+    return False
+
+
+def _best_row_group(comps, n_digits, row_tolerance_frac=0.4, prefer_lowest=True,
+                     tag_height=None, min_y_frac=0.60, allow_irregular_fallback=True,
+                     reject_weak=False):
     """
     Given a pool of digit-shaped components (already deduped), clusters
     them by vertical center (cy) and returns the best-scoring, regular
@@ -426,6 +438,12 @@ def _best_row_group(comps: List[Component], n_digits: int,
     clusters can look "regular" by chance, but the real numeral row is
     never that high up. When multiple regular groups exist, prefers the
     LOWEST one if prefer_lowest is True, matching every verified example.
+
+    If allow_irregular_fallback is False and no properly regular group
+    is found, returns None instead of falling back to the crude
+    "closest median height" heuristic -- letting the caller try smarter
+    gap-interpolation logic instead of accepting a confident-but-wrong
+    guess.
     """
     if len(comps) < n_digits:
         return None
@@ -455,20 +473,21 @@ def _best_row_group(comps: List[Component], n_digits: int,
             best_score = score
             best_group = trimmed
         if _group_is_regular(trimmed):
-            regular_candidates.append((mean_cy, trimmed))
+            if not (reject_weak and _has_weak_member(trimmed)):
+                regular_candidates.append((mean_cy, trimmed))
 
     if regular_candidates:
         regular_candidates.sort(key=lambda item: item[0])
         chosen = regular_candidates[-1][1] if prefer_lowest else regular_candidates[0][1]
         return _reinforce_weak_group_members(chosen)
-    if best_group is not None:
+    if allow_irregular_fallback and best_group is not None:
         return _reinforce_weak_group_members(best_group)
     return None
 
 
 # --------------------------------------------------------------------------- #
-# FIX #19.2: gap interpolation for partial rows (Stage 3, secondary method,
-# tried before falling back to noisy whole-image heuristics)
+# Gap interpolation for partial rows (Stage 3, secondary method, tried
+# before falling back to noisy whole-image heuristics)
 # --------------------------------------------------------------------------- #
 
 def _cluster_candidates_by_row(comps: List[Component], min_count: int,
@@ -498,7 +517,32 @@ def _cluster_candidates_by_row(comps: List[Component], min_count: int,
     return clusters
 
 
-def _try_interpolated_group(group: List[Component], n_digits: int) -> Optional[List[Component]]:
+def _ink_density_in_window(binary_masks: Tuple[np.ndarray, np.ndarray],
+                            x0: float, x1: float, y0: float, y1: float) -> float:
+    """
+    Measures ink density in a window using the full-tag binary masks
+    (both polarities) that were already correctly binarized with full
+    context -- rather than re-thresholding the tiny window in isolation,
+    which is unreliable on a small, near-uniform patch (Otsu and
+    border-based polarity normalization both need enough context to be
+    trustworthy). Returns the higher of the two polarities' densities.
+    """
+    best = 0.0
+    for binary in binary_masks:
+        x0c, x1c = max(0, int(x0)), min(binary.shape[1], int(x1))
+        y0c, y1c = max(0, int(y0)), min(binary.shape[0], int(y1))
+        if x1c <= x0c or y1c <= y0c:
+            continue
+        region = binary[y0c:y1c, x0c:x1c]
+        if region.size == 0:
+            continue
+        best = max(best, float(np.count_nonzero(region)) / region.size)
+    return best
+
+
+def _try_interpolated_group(group: List[Component], n_digits: int,
+                             binary_masks: Optional[Tuple[np.ndarray, np.ndarray]] = None
+                             ) -> Optional[List[Component]]:
     """
     Checks whether a cluster short of n_digits has gaps between its
     members that are clean integer multiples of a consistent pitch --
@@ -507,6 +551,11 @@ def _try_interpolated_group(group: List[Component], n_digits: int) -> Optional[L
     glare/blur). If so, fills the missing slot(s) with interpolated
     boxes (median size, expected position) rather than forcing in an
     unrelated noise blob just to hit n_digits.
+
+    If the shortfall is at one of the two ENDS (no internal gap), the
+    side to extend is decided by checking actual ink density in each
+    candidate extension window (via binary_masks) instead of always
+    assuming the missing digit comes after the last detected one.
     """
     group_sorted = sorted(group, key=lambda c: c.x)
     if len(group_sorted) < max(3, n_digits - 2):
@@ -538,11 +587,31 @@ def _try_interpolated_group(group: List[Component], n_digits: int) -> Optional[L
                                      int(med_w * med_h * 0.4), ix + med_w / 2.0, med_y + med_h / 2.0))
         result.append(group_sorted[i])
 
+    # Any remaining shortfall means the missing digit is at one of the
+    # two ENDS, not internal -- decide which side by checking actual ink
+    # density in the extension window instead of always guessing right.
     while len(result) < n_digits:
-        last = result[-1]
-        ix = int(round(last.x + med_spacing))
-        result.append(Component(ix, int(round(med_y)), int(med_w), int(med_h),
-                                 int(med_w * med_h * 0.4), ix + med_w / 2.0, med_y + med_h / 2.0))
+        extend_right_x = result[-1].x + med_spacing
+        extend_left_x = result[0].x - med_spacing
+        choose_right = True
+        if binary_masks is not None and extend_left_x >= 0:
+            right_density = _ink_density_in_window(
+                binary_masks, extend_right_x, extend_right_x + med_w, med_y, med_y + med_h)
+            left_density = _ink_density_in_window(
+                binary_masks, extend_left_x, extend_left_x + med_w, med_y, med_y + med_h)
+            if left_density > right_density * 1.15:
+                choose_right = False
+        elif extend_left_x < 0:
+            choose_right = True
+
+        if choose_right:
+            ix = int(round(extend_right_x))
+            result.append(Component(ix, int(round(med_y)), int(med_w), int(med_h),
+                                     int(med_w * med_h * 0.4), ix + med_w / 2.0, med_y + med_h / 2.0))
+        else:
+            ix = int(round(extend_left_x))
+            result.insert(0, Component(ix, int(round(med_y)), int(med_w), int(med_h),
+                                        int(med_w * med_h * 0.4), ix + med_w / 2.0, med_y + med_h / 2.0))
 
     return result if len(result) == n_digits else None
 
@@ -551,27 +620,29 @@ def _try_interpolated_group(group: List[Component], n_digits: int) -> Optional[L
 # Cross-polarity component pooling (Stage 3, primary method)
 # --------------------------------------------------------------------------- #
 
-def _collect_tag_components(tag_crop: np.ndarray) -> List[Component]:
+def _collect_tag_components(tag_crop: np.ndarray) -> Tuple[List[Component], np.ndarray, np.ndarray]:
     """
     Binarizes the tag crop under BOTH polarities and merges the
     shape-filtered digit-like components found in each into one pool.
     Different digits on the same tag can render more clearly under
     different polarities (depending on local shadow/highlight from the
     embossing), so relying on a single polarity's pass can miss digits
-    that the other polarity would have caught cleanly.
+    that the other polarity would have caught cleanly. Also returns the
+    two full-tag binary masks themselves, so gap-interpolation can later
+    check ink density with full context instead of re-binarizing a tiny
+    isolated window.
     """
     corrected = correct_illumination(tag_crop)
+    binary_normal = clean_mask(robust_binarize(corrected, polarity="area"))
+    binary_inverted = clean_mask(cv2.bitwise_not(robust_binarize(corrected, polarity="area")))
+
     pool: List[Component] = []
-    for inverted in (False, True):
-        if not inverted:
-            binary = clean_mask(robust_binarize(corrected, polarity="area"))
-        else:
-            binary = clean_mask(cv2.bitwise_not(robust_binarize(corrected, polarity="area")))
+    for binary in (binary_normal, binary_inverted):
         comps = _get_components(binary)
         comps = [c for c in comps if _looks_like_digit(c)]
         comps = _remove_nested_components(comps)
         pool.extend(comps)
-    return _dedupe_cross_polarity(pool)
+    return _dedupe_cross_polarity(pool), binary_normal, binary_inverted
 
 
 # --------------------------------------------------------------------------- #
@@ -758,7 +829,7 @@ def _row_is_plausible(row_y0: int, row_y1: int, tag_height: int, max_frac: float
 def _locate_within_tag(gray: np.ndarray, n_digits: int) -> Optional[List[Tuple[int, int, int, int]]]:
     """
     Stage 1+3: find the tag, pool digit-shaped components from BOTH
-    binarization polarities, and pick the best regular group of
+    binarization polarities, and pick the best REGULAR group of
     n_digits as the numeral row. Falls back to gap-interpolation for a
     partial-but-evenly-spaced row, then to the older single-polarity
     band + valley-split approach, in that order. Returns boxes in
@@ -778,19 +849,24 @@ def _locate_within_tag(gray: np.ndarray, n_digits: int) -> Optional[List[Tuple[i
         return None
     tag_height = tag_crop.shape[0]
 
-    # --- Primary method: cross-polarity component pooling ---
-    pool = _collect_tag_components(tag_crop)
-    group = _best_row_group(pool, n_digits, prefer_lowest=True, tag_height=tag_height)
+    # --- Primary method: cross-polarity component pooling. A non-regular
+    #     "best guess" is intentionally rejected here (allow_irregular_
+    #     fallback=False) so a confident-but-wrong crude answer doesn't
+    #     preempt the smarter gap-interpolation stage below. ---
+    pool, binary_normal, binary_inverted = _collect_tag_components(tag_crop)
+    group = _best_row_group(pool, n_digits, prefer_lowest=True, tag_height=tag_height,
+                         allow_irregular_fallback=False)
     if group is not None:
         return [(tx0 + c.x, ty0 + c.y, c.w, c.h) for c in group]
 
     # --- Secondary method: gap interpolation for a partial, evenly-
     #     spaced row (one or two digits genuinely undetected) ---
+    binary_masks = (binary_normal, binary_inverted)
     for min_count in (n_digits - 1, n_digits - 2):
         clusters = _cluster_candidates_by_row(pool, min_count, tag_height=tag_height)
         interpolated_candidates: List[Tuple[float, List[Component]]] = []
         for cl in clusters:
-            filled = _try_interpolated_group(cl, n_digits)
+            filled = _try_interpolated_group(cl, n_digits, binary_masks=binary_masks)
             if filled is not None:
                 mean_cy = float(np.mean([c.cy for c in cl]))
                 interpolated_candidates.append((mean_cy, filled))
@@ -849,7 +925,8 @@ def _locate_whole_image_fallback(gray: np.ndarray, n_digits: int,
                                   row_tolerance_frac: float = 0.4) -> Optional[List[Tuple[int, int, int, int]]]:
     """
     Previous whole-image dual-polarity method, kept as a fallback for
-    photos where tag-boundary detection (Stage 1) fails.
+    photos where tag-boundary detection (Stage 1) fails. This IS the
+    last resort, so allow_irregular_fallback stays at its default True.
     """
     corrected = correct_illumination(gray)
     binary = clean_mask(robust_binarize(corrected))
