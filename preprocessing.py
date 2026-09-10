@@ -3,40 +3,55 @@ preprocessing.py
 =================
 Shared preprocessing utilities for the seal numeral recognition task.
 
-See prior revisions' fix history (kept brief here; the important recent
-ones are below).
+Fix history (kept brief; most relevant recent ones expanded):
 
 FIX #1-3: training/inference crop preprocessing mismatches (illumination
 kernel on tiny crops, area-based vs border-based polarity, global vs
-per-crop thresholding). All fixed in CharsDataset (model.py) and
+per-crop thresholding). Fixed in CharsDataset (model.py) and
 prepare_isolated_crop()/extract_digit_crops() here.
 
-FIX #4-7: find_digit_row() localization. Added width/spacing regularity
-scoring across ALL row candidates (not just the first match), and an
-aspect-ratio filter so wide/short structural features (molded tag edges,
-lettering baselines) aren't mistaken for digits.
+FIX #4-7: find_digit_row() localization -- regularity scoring across ALL
+row candidates (not just the first match), and an aspect-ratio filter so
+wide/short structural features aren't mistaken for digits.
 
-FIX #8 (this revision -- single global polarity assumption): find_digit_row()
-only ever binarized the photo ONE way (numeral assumed to be the area-
-minority across the whole image). That works for a dark-digits-on-light-
-tag photo, but fails completely for a light-digits-on-dark-tag photo (e.g.
-a black "TESCO" tag with white lettering) -- there, the true digit strokes
-are literally the WRONG polarity relative to what the connected-component
-search is looking for, so zero valid digit-shaped components are ever
-found and the code falls back to the crude last-resort full-image slice.
-find_digit_row() now searches components in BOTH the binarized mask and
-its inverse, pooling candidates from whichever polarity actually contains
-the digit strokes for this particular photo.
+FIX #8: find_digit_row() now searches components in BOTH the binarized
+mask and its inverse, since a photo's digit tag can be dark-on-light OR
+light-on-dark, and a single global polarity choice missed the latter.
 
-FIX #9 (this revision -- phantom component vs. missed real digit): when a
-row candidate has slightly MORE digit-shaped components than n_digits
-(e.g. a stray dust speck or shadow mark happens to be digit-sized/shaped),
-the previous "keep the n_digits closest to median height" heuristic could
-keep the phantom and drop a genuine digit whose height happened to differ
-slightly (e.g. a "4" with an open top). find_digit_row() now searches
-over subsets (small combinatorial search, cheap when only a few
-components are extra) and keeps whichever n_digits subset scores most
-regular overall, rather than a single greedy per-component heuristic.
+FIX #9: when a row candidate has slightly more digit-shaped components
+than n_digits (a stray dust speck/shadow), a small combinatorial search
+picks whichever n_digits subset is most regular, instead of a greedy
+height-closeness heuristic that could keep a phantom and drop a real digit.
+
+FIX #10 (this revision -- crop quality affecting classification broadly):
+after localization was fixed (rotation errors down to 17/1414), the full
+pipeline's per-digit confusion matrix showed a genuinely-classification
+problem: errors spread broadly across ALMOST ALL digits (20-37% error
+rate each), worst on digit 7 (thin strokes, few distinguishing features)
+confused heavily with 2. This is not a "couple of confusable digit pairs"
+issue -- it's consistent with fine stroke detail being eroded before the
+CNN ever sees it. Two changes:
+  (a) clean_mask() gained a use_opening flag. The morphological "opening"
+      step (erode then dilate) actively strips thin protrusions -- exactly
+      the corner of a "7", the serif of a "1", or the gap that separates
+      an "8"'s two loops from looking like a "0"/"6"/"9" blob. Closing
+      alone (dilate then erode, which just bridges small broken gaps in
+      the embossed digit strokes) is much gentler and doesn't erase
+      genuine fine structure. prepare_isolated_crop() now uses
+      use_opening=False; find_digit_row()/extract_digit_crops() (which
+      only need a coarse mask for LOCATING boxes, not the final digit
+      image handed to the CNN) keep opening enabled since aggressive
+      cleanup is fine and even helpful there for removing noise.
+  (b) extract_digit_crops()'s default pad_frac raised from 0.15 to 0.25:
+      the box-selection logic (FIX #4-9) produces boxes fit tightly to a
+      detected component's bounding box, with no inherent margin the way
+      manually-captured isolated training crops might have had. A larger
+      padding margin reduces the risk of clipping a digit's edge stroke.
+
+IMPORTANT: prepare_isolated_crop() is used by BOTH training
+(CharsDataset in model.py) and inference (extract_digit_crops() here) --
+changing it changes what the training data looks like, so digit_cnn.pt
+must be RETRAINED after this change, not just re-evaluated.
 
 Public entry points typically called from main.py / model.py:
 
@@ -116,9 +131,7 @@ def robust_binarize(gray: np.ndarray, polarity: str = "area") -> np.ndarray:
 
     polarity:
     - "area" (default): assumes the numeral is a minority of the total
-      image area. Correct for full seal photos on average, but see FIX #8
-      -- a single global choice can still be locally wrong for a specific
-      sub-region (e.g. a dark tag with light lettering).
+      image area. Correct for full seal photos on average.
     - "border": samples the image border instead. Use for already-cropped,
       tightly-framed single-digit images.
     """
@@ -172,14 +185,25 @@ def normalize_polarity_by_border(binary: np.ndarray, border_frac: float = 0.08) 
 # Morphological cleanup
 # --------------------------------------------------------------------------- #
 
-def clean_mask(binary: np.ndarray, ksize: int = 3) -> np.ndarray:
+def clean_mask(binary: np.ndarray, ksize: int = 3, use_opening: bool = True) -> np.ndarray:
+    """
+    use_opening=True (default): erode-then-dilate before closing. Good for
+    removing small noise specks from a whole-photo binary mask used only
+    for LOCATING boxes.
+    use_opening=False: skip the opening step, only close small gaps.
+    Use this for the FINAL digit crop handed to the CNN -- opening erodes
+    thin strokes (a "7"'s corner, a "1"'s serif, the gap inside an "8")
+    that are exactly the features distinguishing similar-looking digits.
+    """
     h, w = binary.shape[:2]
     ksize = min(ksize, max(1, min(h, w) - 1))
     if ksize < 2:
         return binary
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-    closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel)
+    base = binary
+    if use_opening:
+        base = cv2.morphologyEx(base, cv2.MORPH_OPEN, kernel)
+    closed = cv2.morphologyEx(base, cv2.MORPH_CLOSE, kernel)
     return closed
 
 
@@ -192,15 +216,14 @@ def prepare_isolated_crop(gray: np.ndarray) -> np.ndarray:
     """
     Binarizes an already-isolated digit crop WITHOUT full-image illumination
     correction, using its own LOCAL Otsu threshold and border-based
-    polarity. This is polarity-agnostic per crop, so it correctly handles
-    BOTH dark-on-light and light-on-dark digit crops regardless of which
-    global polarity find_digit_row() used to locate the box.
+    polarity. Uses clean_mask(..., use_opening=False) -- see FIX #10 -- to
+    avoid eroding the thin strokes that distinguish similar digits.
     """
     h, w = gray.shape[:2]
     denoised = denoise(gray, 3)
     binary = robust_binarize(denoised, polarity="border")
     if min(h, w) >= 15:
-        binary = clean_mask(binary, ksize=2)
+        binary = clean_mask(binary, ksize=2, use_opening=False)
     return binary
 
 
@@ -329,10 +352,8 @@ def _best_subset(group: List[Component], n_digits: int, max_search_extra: int = 
     """
     Picks the n_digits-sized subset of `group` that scores most regular.
     Guards against a spurious extra component (dust speck, shadow) being
-    kept over a genuine digit just because it happens to be closer to the
-    group's median height -- see FIX #9. Falls back to a height-closeness
-    heuristic if there are too many extra candidates for exhaustive search
-    to stay cheap.
+    kept over a genuine digit. Falls back to a height-closeness heuristic
+    if there are too many extra candidates for exhaustive search.
     """
     if len(group) <= n_digits:
         return group
@@ -404,13 +425,9 @@ def _uniform_slice_boxes(extent: Tuple[int, int, int, int],
 def find_digit_row(gray: np.ndarray, n_digits: int = 7,
                     row_tolerance_frac: float = 0.4) -> Optional[List[Tuple[int, int, int, int]]]:
     corrected = correct_illumination(gray)
-    binary = clean_mask(robust_binarize(corrected))
+    binary = clean_mask(robust_binarize(corrected))  # use_opening=True default: fine for coarse localization
     binary_inv = clean_mask(cv2.bitwise_not(binary))
 
-    # Pool digit-shaped candidates from BOTH polarities -- the true digit
-    # strokes might be the area-majority "foreground" OR "background" of
-    # the whole photo depending on whether the tag they sit on is light-
-    # on-dark or dark-on-light (see FIX #8).
     comps = _get_components(binary) + _get_components(binary_inv)
     comps = [c for c in comps if _looks_like_digit(c)]
 
@@ -478,7 +495,12 @@ def locate_digit_row_multi_orientation(bgr: np.ndarray,
 # --------------------------------------------------------------------------- #
 
 def extract_digit_crops(gray: np.ndarray, boxes: List[Tuple[int, int, int, int]],
-                         pad_frac: float = 0.15) -> List[np.ndarray]:
+                         pad_frac: float = 0.25) -> List[np.ndarray]:
+    """
+    Slices each digit's box out of the RAW GRAYSCALE full seal image (with
+    generous padding -- see FIX #10b) and binarizes each crop INDIVIDUALLY
+    via prepare_isolated_crop(), matching the training distribution.
+    """
     crops = []
     h_img, w_img = gray.shape[:2]
     for (x, y, w, h) in boxes:
