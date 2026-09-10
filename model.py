@@ -41,7 +41,7 @@ def resolve_device(requested: Optional[str] = None) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Label parsing: "<id>_<label>.<ext>" -> label
+# Label parsing: "<id>_<label>.<ext>" or "<id>_<label>-<position>.<ext>" -> label
 # --------------------------------------------------------------------------- #
 
 def parse_label_from_filename(filename: str) -> Optional[int]:
@@ -49,9 +49,10 @@ def parse_label_from_filename(filename: str) -> Optional[int]:
     if "_" not in stem:
         return None
     tail = stem.rsplit("_", 1)[-1]
-    if not tail.isdigit():
+    label_part = tail.split("-", 1)[0]
+    if not label_part.isdigit():
         return None
-    value = int(tail)
+    value = int(label_part)
     if 0 <= value <= 9:
         return value
     return None
@@ -148,6 +149,66 @@ def get_or_create_splits(chars_dir: str, manifest_dir: Optional[str] = None,
 # Augmentation (train-time only)
 # --------------------------------------------------------------------------- #
 
+def add_speckle_noise(img: np.ndarray, rng: random.Random, max_specks: int = 6) -> np.ndarray:
+    """
+    Lights up a handful of isolated single/few-pixel dots at random
+    locations, mimicking the fine surface-texture speckle noise seen in
+    real seal photos (metal/plastic tag grain) that the clean isolated
+    training scans don't have. Trains the CNN to ignore small unconnected
+    noise blobs rather than being thrown off by them.
+    """
+    if rng.random() >= 0.4:
+        return img
+    out = img.copy()
+    h, w = out.shape
+    n_specks = rng.randint(1, max_specks)
+    for _ in range(n_specks):
+        cx, cy = rng.randint(0, w - 1), rng.randint(0, h - 1)
+        r = rng.choice([0, 1])
+        val = rng.uniform(0.6, 1.0)
+        y0, y1 = max(0, cy - r), min(h, cy + r + 1)
+        x0, x1 = max(0, cx - r), min(w, cx + r + 1)
+        out[y0:y1, x0:x1] = np.maximum(out[y0:y1, x0:x1], val)
+    return out
+
+
+def random_morph(img: np.ndarray, rng: random.Random) -> np.ndarray:
+    """
+    Randomly thins or thickens the digit stroke slightly, mimicking the
+    stroke-width variability introduced by embossing/lighting/thresholding
+    differences between the clean training scans and real photo crops
+    (e.g. a thin "7" corner or the gap separating an "8"'s two loops can
+    come out thicker or thinner depending on real-world exposure).
+    """
+    if rng.random() >= 0.4:
+        return img
+    binary_u8 = (img > 0.5).astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+    if rng.random() < 0.5:
+        morphed = cv2.erode(binary_u8, kernel, iterations=1)
+    else:
+        morphed = cv2.dilate(binary_u8, kernel, iterations=1)
+    return morphed.astype(np.float32) / 255.0
+
+
+def random_erase(img: np.ndarray, rng: random.Random) -> np.ndarray:
+    """
+    Blacks out a small random rectangular patch, mimicking partial glare
+    or occlusion that can wipe out part of a digit's stroke in real
+    photos (e.g. one loop of an "8", or a "7"'s corner going missing).
+    """
+    if rng.random() >= 0.25:
+        return img
+    out = img.copy()
+    h, w = out.shape
+    ew = rng.randint(2, max(2, w // 4))
+    eh = rng.randint(2, max(2, h // 4))
+    ex = rng.randint(0, max(0, w - ew))
+    ey = rng.randint(0, max(0, h - eh))
+    out[ey:ey + eh, ex:ex + ew] = 0.0
+    return out
+
+
 def augment_digit(canvas: np.ndarray, rng: random.Random) -> np.ndarray:
     img = canvas.copy()
 
@@ -167,6 +228,12 @@ def augment_digit(canvas: np.ndarray, rng: random.Random) -> np.ndarray:
         M[0, 2] += tx
         M[1, 2] += ty
         img = cv2.warpAffine(img, M, (IMG_SIZE, IMG_SIZE), borderValue=0)
+
+    # Domain-randomization additions: mimic real-photo-crop degradation
+    # that the clean isolated training scans don't naturally have.
+    img = random_morph(img, rng)
+    img = add_speckle_noise(img, rng)
+    img = random_erase(img, rng)
 
     if rng.random() < 0.6:
         gain = rng.uniform(0.6, 1.4)
@@ -199,11 +266,6 @@ class CharsDataset(Dataset):
         path = os.path.join(self.chars_dir, fname)
         gray = pp.to_gray(pp.load_image(path))
 
-        # FIX: these are already-cropped, tightly-framed single-digit images
-        # (ground_truth_chars_balanced), NOT full seal photos. Use the
-        # isolated-crop path instead of correct_illumination()+robust_binarize()
-        # +clean_mask(), whose large background-blur kernel gets capped to
-        # nearly the whole crop and flattens the digit before thresholding.
         binary = pp.prepare_isolated_crop(gray)
         canvas = pp.to_classical_canvas(binary, size=IMG_SIZE).astype(np.float32)
 
@@ -298,7 +360,7 @@ def train_model(chars_dir: str, out_path: str, manifest_dir: Optional[str] = Non
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            torch.save({"model_state": model.state_dict(), "val_acc": val_acc}, out_path)
+            torch.save({"model_state": model.state_dict(), "val_acc": val_acc, "img_size": IMG_SIZE}, out_path)
 
     print(f"best val_acc={best_val_acc:.4f}, saved to {out_path}")
     return model
@@ -357,8 +419,15 @@ def predict_digits(model: DigitCNN, crops: List[np.ndarray], device: Optional[st
 
 def recognize_seal(model: DigitCNN, image_path: str, n_digits: int = N_DIGITS_DEFAULT,
                     device: Optional[str] = None) -> Optional[str]:
-
-    crops = pp.preprocess_seal(image_path, mode="cnn", n_digits=n_digits)
+    """
+    Produces the deliverable: a full multi-digit code string (e.g.
+    "1584143", 7 digits). Localizes the digit row on the whole seal image
+    via preprocessing.py, classifies each crop with the CNN, and joins the
+    results in left-to-right order. Returns None if the digit row couldn't
+    be located at all. Passes IMG_SIZE through to preprocess_seal() so the
+    canvas size fed to the CNN always matches what it was trained on.
+    """
+    crops = pp.preprocess_seal(image_path, mode="cnn", n_digits=n_digits, img_size=IMG_SIZE)
     if crops is None or len(crops) != n_digits:
         return None
     digits = predict_digits(model, crops, device=device)

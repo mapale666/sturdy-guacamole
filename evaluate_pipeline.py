@@ -1,34 +1,3 @@
-"""
-evaluate_pipeline.py
-=====================
-End-to-end evaluation of the FULL seal recognition pipeline (localization +
-digit classification combined) against the train/val/test seal-image
-folders, using the ground-truth codes in splits/split_seals/*.csv.
-
-CSV format confirmed: semicolon-delimited, columns "filename;number".
-Seal codes are 7 digits (e.g. "1584143") -- n_digits defaults to 7.
-
---sample-size / --seed: evaluate on a random subset instead of the full
-folder, for fast iteration while debugging (each full 1414-image run
-currently takes ~13-15 minutes). Sampling is done with a fixed seed by
-default so results are reproducible/comparable across runs while you're
-iterating on preprocessing changes -- pass --seed to change the subset,
-or omit --sample-size to evaluate everything (used for final numbers).
-
-Confusion-matrix / rotation-detection instrumentation (see earlier
-revision) is preserved: it distinguishes whole-sequence rotation errors
-(a leftover localization/box-ordering issue) from genuine per-digit
-classification errors, and prints a 10x10 confusion matrix plus the
-most-confused digit pairs.
-
-Usage:
-python evaluate_pipeline.py \
-    --images-dir val \
-    --labels-csv splits/split_seals/val.csv \
-    --checkpoint digit_cnn.pt \
-    --sample-size 200
-"""
-
 from __future__ import annotations
 
 import argparse
