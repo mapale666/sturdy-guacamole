@@ -276,11 +276,11 @@ def _iou(a: Component, b: Component) -> float:
 
 def _dedupe_cross_polarity(comps: List[Component], overlap_thresh: float = 0.35) -> List[Component]:
     """
-    FIX #17.2 helper: when merging component pools detected under two
-    different binarization polarities, the same physical digit is often
-    picked up by both passes with slightly different bounding boxes.
-    Keeps the higher-fill (cleaner) detection of each overlapping pair
-    rather than treating them as two separate digits.
+    When merging component pools detected under two different
+    binarization polarities, the same physical digit is often picked up
+    by both passes with slightly different bounding boxes. Keeps the
+    higher-fill (cleaner) detection of each overlapping pair rather than
+    treating them as two separate digits.
     """
     def fill_ratio(c: Component) -> float:
         return c.area / float(c.w * c.h) if c.w > 0 and c.h > 0 else 0.0
@@ -325,11 +325,9 @@ def _group_is_regular(group: List[Component], tol: float = 0.35) -> bool:
 
 
 def _best_subset(group: List[Component], n_digits: int, max_search_extra: int = 6) -> List[Component]:
-    # FIX #16.1: previously returned `group` as-is here, in raster-scan
-    # (connected-component labeling) order rather than left-to-right
-    # reading order. Downstream code assumes boxes[i] is the i-th digit
-    # from the left, so this caused scrambled output ordering whenever
-    # exactly n_digits shape-filtered components were found.
+    # Early-return branch sorts by x -- connected-component labeling
+    # order is a raster scan, not left-to-right reading order, and
+    # downstream code assumes boxes[i] is the i-th digit from the left.
     if len(group) <= n_digits:
         return sorted(group, key=lambda c: c.x)
     if len(group) - n_digits <= max_search_extra:
@@ -362,11 +360,73 @@ def _uniform_slice_boxes(extent: Tuple[int, int, int, int],
     return boxes
 
 
+def _reinforce_weak_group_members(group: List[Component], fill_ratio_drop: float = 0.5,
+                                   size_drop: float = 0.55) -> List[Component]:
+    """
+    Any member that's undersized or unusually low-fill relative to the
+    row's median is likely an edge-clipped/partial detection. Its box
+    geometry is replaced with the row's median width/height, and its
+    x-position is re-estimated by extrapolating the pitch established by
+    the GOOD neighboring members -- not by recentering on its own
+    centroid, which is biased toward whichever side of the digit
+    actually got detected before being clipped.
+    """
+    if len(group) < 2:
+        return group
+    group_sorted = sorted(group, key=lambda c: c.x)
+    n = len(group_sorted)
+    fills = [c.area / float(c.w * c.h) if c.w > 0 and c.h > 0 else 0.0 for c in group_sorted]
+    med_fill = float(np.median(fills)) if fills else 0.0
+    med_w = float(np.median([c.w for c in group_sorted]))
+    med_h = float(np.median([c.h for c in group_sorted]))
+    med_y = float(np.median([c.y for c in group_sorted]))
+
+    weak = [
+        (c.w < med_w * size_drop or c.h < med_h * size_drop or fills[i] < med_fill * fill_ratio_drop)
+        for i, c in enumerate(group_sorted)
+    ]
+
+    good_idx = [i for i in range(n) if not weak[i]]
+    pitch = med_w * 1.3
+    if len(good_idx) >= 2:
+        pitches = [
+            (group_sorted[b].x - group_sorted[a].x) / (b - a)
+            for a, b in zip(good_idx[:-1], good_idx[1:])
+        ]
+        pitch = float(np.median(pitches))
+
+    result = list(group_sorted)
+    for i in range(n):
+        if not weak[i]:
+            continue
+        c = result[i]
+        if i > 0 and not weak[i - 1]:
+            anchor_x = result[i - 1].x + pitch
+        elif i < n - 1 and not weak[i + 1]:
+            anchor_x = result[i + 1].x - pitch
+        else:
+            anchor_x = c.x + c.w / 2.0 - med_w / 2.0  # no good neighbor -- fall back to recentering
+        new_x = int(round(anchor_x))
+        new_y = int(round(med_y))
+        result[i] = Component(new_x, new_y, int(med_w), int(med_h),
+                               int(med_w * med_h * 0.4), new_x + med_w / 2.0, new_y + med_h / 2.0)
+    return result
+
 def _best_row_group(comps: List[Component], n_digits: int,
                      row_tolerance_frac: float = 0.4,
                      prefer_lowest: bool = True,
                      tag_height: Optional[int] = None,
                      min_y_frac: float = 0.60) -> Optional[List[Component]]:
+    """
+    Given a pool of digit-shaped components (already deduped), clusters
+    them by vertical center (cy) and returns the best-scoring, regular
+    group of n_digits components. Any candidate group whose vertical
+    center sits above the bottom min_y_frac of the tag is rejected
+    outright, even if it scores well -- background/texture noise
+    clusters can look "regular" by chance, but the real numeral row is
+    never that high up. When multiple regular groups exist, prefers the
+    LOWEST one if prefer_lowest is True, matching every verified example.
+    """
     if len(comps) < n_digits:
         return None
 
@@ -388,9 +448,6 @@ def _best_row_group(comps: List[Component], n_digits: int,
             continue
         trimmed = _best_subset(group, n_digits)
         mean_cy = float(np.mean([c.cy for c in trimmed]))
-        # FIX #18.2: reject any candidate group centered above the bottom
-        # 60% of the tag -- the numeral row never sits this high in any
-        # verified example, only noise clusters do on blurry photos.
         if tag_height and mean_cy < min_y_frac * tag_height:
             continue
         score = _group_score(trimmed)
@@ -402,12 +459,96 @@ def _best_row_group(comps: List[Component], n_digits: int,
 
     if regular_candidates:
         regular_candidates.sort(key=lambda item: item[0])
-        return regular_candidates[-1][1] if prefer_lowest else regular_candidates[0][1]
-    return best_group
+        chosen = regular_candidates[-1][1] if prefer_lowest else regular_candidates[0][1]
+        return _reinforce_weak_group_members(chosen)
+    if best_group is not None:
+        return _reinforce_weak_group_members(best_group)
+    return None
 
 
 # --------------------------------------------------------------------------- #
-# FIX #17.2: cross-polarity component pooling (Stage 3, primary method)
+# FIX #19.2: gap interpolation for partial rows (Stage 3, secondary method,
+# tried before falling back to noisy whole-image heuristics)
+# --------------------------------------------------------------------------- #
+
+def _cluster_candidates_by_row(comps: List[Component], min_count: int,
+                                row_tolerance_frac: float = 0.4,
+                                tag_height: Optional[int] = None,
+                                min_y_frac: float = 0.60) -> List[List[Component]]:
+    if len(comps) < min_count:
+        return []
+    heights = sorted(c.h for c in comps)
+    ref_h = heights[len(heights) // 2]
+    row_tol = ref_h * row_tolerance_frac
+    sorted_by_y = sorted(comps, key=lambda c: c.cy)
+    clusters: List[List[Component]] = []
+    seen = set()
+    for base in sorted_by_y:
+        key = round(base.cy)
+        if key in seen:
+            continue
+        seen.add(key)
+        group = [c for c in comps if abs(c.cy - base.cy) <= row_tol]
+        if len(group) < min_count:
+            continue
+        mean_cy = float(np.mean([c.cy for c in group]))
+        if tag_height and mean_cy < min_y_frac * tag_height:
+            continue
+        clusters.append(group)
+    return clusters
+
+
+def _try_interpolated_group(group: List[Component], n_digits: int) -> Optional[List[Component]]:
+    """
+    Checks whether a cluster short of n_digits has gaps between its
+    members that are clean integer multiples of a consistent pitch --
+    i.e. the row really is evenly spaced and one or two digits simply
+    failed shape detection at that exact spot (common with local
+    glare/blur). If so, fills the missing slot(s) with interpolated
+    boxes (median size, expected position) rather than forcing in an
+    unrelated noise blob just to hit n_digits.
+    """
+    group_sorted = sorted(group, key=lambda c: c.x)
+    if len(group_sorted) < max(3, n_digits - 2):
+        return None
+    xs = np.array([c.x for c in group_sorted], dtype=np.float32)
+    diffs = np.diff(xs)
+    if len(diffs) == 0 or np.any(diffs <= 0):
+        return None
+    med_spacing = float(np.median(diffs))
+    if med_spacing <= 0:
+        return None
+    multiples = np.round(diffs / med_spacing)
+    if np.any(multiples < 1):
+        return None
+    residual = np.abs(diffs - multiples * med_spacing) / med_spacing
+    if np.max(residual) > 0.35:
+        return None  # not a clean arithmetic progression -- unsafe to interpolate
+
+    med_w = float(np.median([c.w for c in group_sorted]))
+    med_h = float(np.median([c.h for c in group_sorted]))
+    med_y = float(np.median([c.y for c in group_sorted]))
+
+    result = [group_sorted[0]]
+    for i in range(1, len(group_sorted)):
+        n_slots = int(round((group_sorted[i].x - result[-1].x) / med_spacing))
+        for _ in range(1, n_slots):
+            ix = int(round(result[-1].x + med_spacing))
+            result.append(Component(ix, int(round(med_y)), int(med_w), int(med_h),
+                                     int(med_w * med_h * 0.4), ix + med_w / 2.0, med_y + med_h / 2.0))
+        result.append(group_sorted[i])
+
+    while len(result) < n_digits:
+        last = result[-1]
+        ix = int(round(last.x + med_spacing))
+        result.append(Component(ix, int(round(med_y)), int(med_w), int(med_h),
+                                 int(med_w * med_h * 0.4), ix + med_w / 2.0, med_y + med_h / 2.0))
+
+    return result if len(result) == n_digits else None
+
+
+# --------------------------------------------------------------------------- #
+# Cross-polarity component pooling (Stage 3, primary method)
 # --------------------------------------------------------------------------- #
 
 def _collect_tag_components(tag_crop: np.ndarray) -> List[Component]:
@@ -434,7 +575,7 @@ def _collect_tag_components(tag_crop: np.ndarray) -> List[Component]:
 
 
 # --------------------------------------------------------------------------- #
-# Projection-profile valley splitter (Stage 3, secondary fallback). Used
+# Projection-profile valley splitter (Stage 3, tertiary fallback). Used
 # when even the merged cross-polarity pool can't cleanly separate
 # n_digits blobs -- typically because two digits are touching/merged.
 # --------------------------------------------------------------------------- #
@@ -496,8 +637,8 @@ def _valley_split_row(row_binary: np.ndarray, n_digits: int) -> Optional[List[Tu
 
 def _find_tag_bbox_attempt(blurred: np.ndarray, img_area: float,
                             low: int, high: int) -> Optional[Tuple[int, int, int, int]]:
-    h, w = blurred.shape[:2]
     edges = cv2.Canny(blurred, low, high)
+    # Bridge small gaps in a faint/blurry embossed border before dilating.
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
     edges = cv2.dilate(edges, np.ones((5, 5), np.uint8), iterations=2)
 
@@ -616,19 +757,20 @@ def _row_is_plausible(row_y0: int, row_y1: int, tag_height: int, max_frac: float
 
 def _locate_within_tag(gray: np.ndarray, n_digits: int) -> Optional[List[Tuple[int, int, int, int]]]:
     """
-    Stage 1+3 (primary): find the tag, pool digit-shaped components from
-    BOTH binarization polarities, and pick the lowest regular group of
-    n_digits as the numeral row. Falls back to the older single-polarity
-    band + valley-split approach if the merged pool comes up short.
-    Returns boxes in ORIGINAL (full-image) coordinates, or None.
+    Stage 1+3: find the tag, pool digit-shaped components from BOTH
+    binarization polarities, and pick the best regular group of
+    n_digits as the numeral row. Falls back to gap-interpolation for a
+    partial-but-evenly-spaced row, then to the older single-polarity
+    band + valley-split approach, in that order. Returns boxes in
+    ORIGINAL (full-image) coordinates, or None.
     """
     tag_bbox = _find_tag_bbox(gray)
     if tag_bbox is None:
         return None
     tx0, ty0, tx1, ty1 = tag_bbox
-    pad_x = max(2, int(0.03 * (tx1 - tx0)))
-    pad_y = max(2, int(0.03 * (ty1 - ty0)))
     img_h, img_w = gray.shape[:2]
+    pad_x = max(2, int(0.06 * (tx1 - tx0)))
+    pad_y = max(2, int(0.06 * (ty1 - ty0)))
     tx0, ty0 = max(0, tx0 - pad_x), max(0, ty0 - pad_y)
     tx1, ty1 = min(img_w, tx1 + pad_x), min(img_h, ty1 + pad_y)
     tag_crop = gray[ty0:ty1, tx0:tx1]
@@ -642,7 +784,22 @@ def _locate_within_tag(gray: np.ndarray, n_digits: int) -> Optional[List[Tuple[i
     if group is not None:
         return [(tx0 + c.x, ty0 + c.y, c.w, c.h) for c in group]
 
-    # --- Secondary fallback: single-polarity band + valley split ---
+    # --- Secondary method: gap interpolation for a partial, evenly-
+    #     spaced row (one or two digits genuinely undetected) ---
+    for min_count in (n_digits - 1, n_digits - 2):
+        clusters = _cluster_candidates_by_row(pool, min_count, tag_height=tag_height)
+        interpolated_candidates: List[Tuple[float, List[Component]]] = []
+        for cl in clusters:
+            filled = _try_interpolated_group(cl, n_digits)
+            if filled is not None:
+                mean_cy = float(np.mean([c.cy for c in cl]))
+                interpolated_candidates.append((mean_cy, filled))
+        if interpolated_candidates:
+            interpolated_candidates.sort(key=lambda item: item[0])
+            chosen = interpolated_candidates[-1][1]
+            return [(tx0 + c.x, ty0 + c.y, c.w, c.h) for c in chosen]
+
+    # --- Tertiary fallback: single-polarity band + valley split ---
     corrected = correct_illumination(tag_crop)
     for polarity_first in ("area", "inverted"):
         if polarity_first == "area":
@@ -655,8 +812,8 @@ def _locate_within_tag(gray: np.ndarray, n_digits: int) -> Optional[List[Tuple[i
             continue
 
         for y0, y1 in reversed(bands):
-            pad_y = max(3, int(0.1 * (y1 - y0)))
-            row_y0, row_y1 = max(0, y0 - pad_y), min(binary.shape[0], y1 + pad_y)
+            pad_y2 = max(3, int(0.1 * (y1 - y0)))
+            row_y0, row_y1 = max(0, y0 - pad_y2), min(binary.shape[0], y1 + pad_y2)
             if not _row_is_plausible(row_y0, row_y1, tag_height):
                 continue
             row_binary = binary[row_y0:row_y1, :]
@@ -700,7 +857,7 @@ def _locate_whole_image_fallback(gray: np.ndarray, n_digits: int,
 
     comps = _get_components(binary) + _get_components(binary_inv)
     comps = [c for c in comps if _looks_like_digit(c)]
-    comps = _remove_nested_components(comps)
+    comps = _dedupe_cross_polarity(_remove_nested_components(comps))
 
     group = _best_row_group(comps, n_digits, row_tolerance_frac=row_tolerance_frac, prefer_lowest=True)
     if group is not None:
