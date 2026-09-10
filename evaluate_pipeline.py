@@ -8,25 +8,25 @@ folders, using the ground-truth codes in splits/split_seals/*.csv.
 CSV format confirmed: semicolon-delimited, columns "filename;number".
 Seal codes are 7 digits (e.g. "1584143") -- n_digits defaults to 7.
 
-INSTRUMENTATION ADDED: a per-digit-class 10x10 confusion matrix (built
-from position-aligned true/pred digits across every evaluated image) and
-a cyclic-rotation detector. These two things look similar in the raw
-error list -- "true=1584795 pred=5158479" looks like scattered digit
-errors, but it's actually the WHOLE sequence rotated by one position
-(a leftover localization/box-ordering issue), not a classifier confusion
-between specific digits. Mixing rotation errors into a "which digits does
-the classifier confuse" analysis would give misleading answers -- e.g. it
-would look like every digit is confused with its neighbor, when the
-actual cause is unrelated to per-digit classification at all. Separating
-these lets you tell whether further effort should go into the CNN/crop
-preprocessing (fix specific digit-pair confusions) or into localization
-(fix the remaining box-ordering edge cases).
+--sample-size / --seed: evaluate on a random subset instead of the full
+folder, for fast iteration while debugging (each full 1414-image run
+currently takes ~13-15 minutes). Sampling is done with a fixed seed by
+default so results are reproducible/comparable across runs while you're
+iterating on preprocessing changes -- pass --seed to change the subset,
+or omit --sample-size to evaluate everything (used for final numbers).
+
+Confusion-matrix / rotation-detection instrumentation (see earlier
+revision) is preserved: it distinguishes whole-sequence rotation errors
+(a leftover localization/box-ordering issue) from genuine per-digit
+classification errors, and prints a 10x10 confusion matrix plus the
+most-confused digit pairs.
 
 Usage:
 python evaluate_pipeline.py \
     --images-dir val \
     --labels-csv splits/split_seals/val.csv \
-    --checkpoint digit_cnn.pt
+    --checkpoint digit_cnn.pt \
+    --sample-size 200
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import random
 import time
 from typing import Dict, List, Tuple
 
@@ -64,8 +65,8 @@ def cyclic_rotation_shift(pred: str, true: str) -> "int | None":
     """
     Returns the shift k (1 <= k < len(true)) such that
     true[k:] + true[:k] == pred, or None if pred isn't an exact cyclic
-    rotation of true. Used to separate localization/box-ordering errors
-    (whole sequence shifted) from genuine per-digit classification errors.
+    rotation of true. Separates localization/box-ordering errors (whole
+    sequence shifted) from genuine per-digit classification errors.
     """
     if len(pred) != len(true) or len(true) < 2:
         return None
@@ -79,10 +80,16 @@ def cyclic_rotation_shift(pred: str, true: str) -> "int | None":
 def evaluate(images_dir: str, labels_csv: str, checkpoint: str,
              filename_col: str = "filename", code_col: str = "number",
              delimiter: str = ";", n_digits: int = N_DIGITS_DEFAULT,
-             device: str = None):
+             device: str = None, sample_size: int = None, seed: int = 42):
     device = resolve_device(device)
     model = load_model(checkpoint, device=device)
     labels = load_labels(labels_csv, filename_col, code_col, delimiter)
+
+    items = list(labels.items())
+    if sample_size is not None and sample_size < len(items):
+        rng = random.Random(seed)
+        items = rng.sample(items, sample_size)
+        print(f"[INFO] evaluating a random sample of {sample_size}/{len(labels)} images (seed={seed})")
 
     total, exact_correct = 0, 0
     total_digits, correct_digits = 0, 0
@@ -94,7 +101,7 @@ def evaluate(images_dir: str, labels_csv: str, checkpoint: str,
     confusion = np.zeros((10, 10), dtype=int)  # rows=true digit, cols=predicted digit
 
     t_start = time.time()
-    for fname, true_code in labels.items():
+    for fname, true_code in items:
         path = os.path.join(images_dir, fname)
         if not os.path.exists(path):
             print(f"[WARN] listed in {labels_csv} but missing on disk: {fname}")
@@ -135,7 +142,7 @@ def evaluate(images_dir: str, labels_csv: str, checkpoint: str,
 
     print(f"\n=== Full pipeline evaluation: {images_dir} ===")
     print(f"n_digits assumed:        {n_digits}")
-    print(f"images evaluated:        {total}")
+    print(f"images evaluated:        {total}" + (f" (sampled from {len(labels)})" if sample_size else ""))
     print(f"exact full-code accuracy: {exact_acc:.4f} ({exact_correct}/{total})")
     print(f"per-digit accuracy:       {digit_acc:.4f} ({correct_digits}/{total_digits})")
     print(f"localization failures:   {localization_failures}")
@@ -186,8 +193,13 @@ if __name__ == "__main__":
     parser.add_argument("--delimiter", default=";")
     parser.add_argument("--n-digits", type=int, default=N_DIGITS_DEFAULT)
     parser.add_argument("--device", choices=["cuda", "cpu"], default=None)
+    parser.add_argument("--sample-size", type=int, default=None,
+                         help="Evaluate a random subset of this many images instead of the full folder (fast iteration).")
+    parser.add_argument("--seed", type=int, default=42,
+                         help="Random seed for --sample-size, so repeated runs sample the same subset.")
     args = parser.parse_args()
 
     evaluate(args.images_dir, args.labels_csv, args.checkpoint,
              filename_col=args.filename_col, code_col=args.code_col,
-             delimiter=args.delimiter, n_digits=args.n_digits, device=args.device)
+             delimiter=args.delimiter, n_digits=args.n_digits, device=args.device,
+             sample_size=args.sample_size, seed=args.seed)

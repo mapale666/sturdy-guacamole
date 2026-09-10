@@ -7,51 +7,39 @@ Fix history (kept brief; most relevant recent ones expanded):
 
 FIX #1-3: training/inference crop preprocessing mismatches (illumination
 kernel on tiny crops, area-based vs border-based polarity, global vs
-per-crop thresholding). Fixed in CharsDataset (model.py) and
-prepare_isolated_crop()/extract_digit_crops() here.
+per-crop thresholding).
 
-FIX #4-7: find_digit_row() localization -- regularity scoring across ALL
-row candidates (not just the first match), and an aspect-ratio filter so
-wide/short structural features aren't mistaken for digits.
+FIX #4-9: find_digit_row() localization -- regularity scoring across ALL
+row candidates, aspect-ratio filtering, dual-polarity component search,
+and combinatorial best-subset selection. Confirmed working well via
+visual inspection (boxes now land tightly on individual digits).
 
-FIX #8: find_digit_row() now searches components in BOTH the binarized
-mask and its inverse, since a photo's digit tag can be dark-on-light OR
-light-on-dark, and a single global polarity choice missed the latter.
+FIX #10a (REVERTED): disabling clean_mask()'s "opening" step in
+prepare_isolated_crop() was based on a wrong diagnosis. Opening wasn't
+primarily eroding fine digit-stroke detail -- its main effect here was
+removing small, isolated SPECKLE NOISE from the tag's grainy surface
+texture (visible in the seal photos as fine white speckle on the gray
+background). Real inference crops have this surface grain; the
+ground_truth_chars_balanced training crops apparently don't (or much
+less), which is why isolated-char test accuracy barely changed (~98%)
+while full-pipeline accuracy collapsed (74%->61% per-digit) -- the CNN
+was suddenly fed crops full of noise dots it never learned to ignore.
 
-FIX #9: when a row candidate has slightly more digit-shaped components
-than n_digits (a stray dust speck/shadow), a small combinatorial search
-picks whichever n_digits subset is most regular, instead of a greedy
-height-closeness heuristic that could keep a phantom and drop a real digit.
-
-FIX #10 (this revision -- crop quality affecting classification broadly):
-after localization was fixed (rotation errors down to 17/1414), the full
-pipeline's per-digit confusion matrix showed a genuinely-classification
-problem: errors spread broadly across ALMOST ALL digits (20-37% error
-rate each), worst on digit 7 (thin strokes, few distinguishing features)
-confused heavily with 2. This is not a "couple of confusable digit pairs"
-issue -- it's consistent with fine stroke detail being eroded before the
-CNN ever sees it. Two changes:
-  (a) clean_mask() gained a use_opening flag. The morphological "opening"
-      step (erode then dilate) actively strips thin protrusions -- exactly
-      the corner of a "7", the serif of a "1", or the gap that separates
-      an "8"'s two loops from looking like a "0"/"6"/"9" blob. Closing
-      alone (dilate then erode, which just bridges small broken gaps in
-      the embossed digit strokes) is much gentler and doesn't erase
-      genuine fine structure. prepare_isolated_crop() now uses
-      use_opening=False; find_digit_row()/extract_digit_crops() (which
-      only need a coarse mask for LOCATING boxes, not the final digit
-      image handed to the CNN) keep opening enabled since aggressive
-      cleanup is fine and even helpful there for removing noise.
-  (b) extract_digit_crops()'s default pad_frac raised from 0.15 to 0.25:
-      the box-selection logic (FIX #4-9) produces boxes fit tightly to a
-      detected component's bounding box, with no inherent margin the way
-      manually-captured isolated training crops might have had. A larger
-      padding margin reduces the risk of clipping a digit's edge stroke.
+FIX #11 (this revision): replaced the opening-vs-no-opening tradeoff with
+a targeted connected-component size filter, _despeckle(). A digit's
+stroke, even where thin (a "7"'s corner, a "1"'s serif), remains part of
+ONE larger connected blob. Sensor/surface-texture noise shows up as many
+small, ISOLATED specks unconnected to the digit. _despeckle() removes
+only components below a small size threshold, leaving the digit's full
+connected shape -- including thin parts -- completely untouched, while
+still scrubbing out the grain noise that broke FIX #10a.
+prepare_isolated_crop() now uses denoise -> threshold -> despeckle ->
+gentle close (no opening).
 
 IMPORTANT: prepare_isolated_crop() is used by BOTH training
 (CharsDataset in model.py) and inference (extract_digit_crops() here) --
-changing it changes what the training data looks like, so digit_cnn.pt
-must be RETRAINED after this change, not just re-evaluated.
+changing it changes the training data, so digit_cnn.pt must be RETRAINED
+after this change.
 
 Public entry points typically called from main.py / model.py:
 
@@ -95,12 +83,6 @@ def to_gray(bgr: np.ndarray) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 
 def correct_illumination(gray: np.ndarray, blur_ksize: int = 51) -> np.ndarray:
-    """
-    Flattens vignetting / uneven exposure by dividing out a heavily blurred
-    version of the image, then re-normalizes contrast with CLAHE. Intended
-    for full seal photos. DO NOT use this on small, already-cropped
-    individual digit images -- see prepare_isolated_crop() instead.
-    """
     h, w = gray.shape[:2]
     ksize = min(blur_ksize, max(3, min(h, w) - 1))
     ksize = ksize | 1
@@ -125,16 +107,6 @@ def denoise(gray: np.ndarray, ksize: int = 3) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 
 def robust_binarize(gray: np.ndarray, polarity: str = "area") -> np.ndarray:
-    """
-    Produces a binary image with numeral pixels = 255, background = 0.
-    Tries Otsu first, falls back to adaptive thresholding if degenerate.
-
-    polarity:
-    - "area" (default): assumes the numeral is a minority of the total
-      image area. Correct for full seal photos on average.
-    - "border": samples the image border instead. Use for already-cropped,
-      tightly-framed single-digit images.
-    """
     blurred = denoise(gray, 3)
     _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
@@ -186,15 +158,6 @@ def normalize_polarity_by_border(binary: np.ndarray, border_frac: float = 0.08) 
 # --------------------------------------------------------------------------- #
 
 def clean_mask(binary: np.ndarray, ksize: int = 3, use_opening: bool = True) -> np.ndarray:
-    """
-    use_opening=True (default): erode-then-dilate before closing. Good for
-    removing small noise specks from a whole-photo binary mask used only
-    for LOCATING boxes.
-    use_opening=False: skip the opening step, only close small gaps.
-    Use this for the FINAL digit crop handed to the CNN -- opening erodes
-    thin strokes (a "7"'s corner, a "1"'s serif, the gap inside an "8")
-    that are exactly the features distinguishing similar-looking digits.
-    """
     h, w = binary.shape[:2]
     ksize = min(ksize, max(1, min(h, w) - 1))
     if ksize < 2:
@@ -207,6 +170,28 @@ def clean_mask(binary: np.ndarray, ksize: int = 3, use_opening: bool = True) -> 
     return closed
 
 
+def _despeckle(binary: np.ndarray, min_area_frac: float = 0.012, min_area_px: int = 3) -> np.ndarray:
+    """
+    Removes small, ISOLATED connected components (sensor/surface-texture
+    speckle noise) while leaving the digit's own connected shape -- even
+    thin parts like a "7"'s corner or a "1"'s serif -- completely intact,
+    since those remain part of ONE larger connected blob rather than
+    separate tiny dots. This is the targeted replacement for the
+    blanket morphological "opening" that used to erode fine stroke detail
+    uniformly (see FIX #11).
+    """
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if n_labels <= 1:
+        return binary
+    total_area = binary.shape[0] * binary.shape[1]
+    threshold = max(min_area_px, total_area * min_area_frac)
+    keep = np.zeros_like(binary)
+    for i in range(1, n_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= threshold:
+            keep[labels == i] = 255
+    return keep
+
+
 # --------------------------------------------------------------------------- #
 # Isolated-crop normalization (ground_truth_chars_balanced -- TRAINING DATA,
 # AND every individual digit crop pulled out of a full seal photo)
@@ -216,13 +201,15 @@ def prepare_isolated_crop(gray: np.ndarray) -> np.ndarray:
     """
     Binarizes an already-isolated digit crop WITHOUT full-image illumination
     correction, using its own LOCAL Otsu threshold and border-based
-    polarity. Uses clean_mask(..., use_opening=False) -- see FIX #10 -- to
-    avoid eroding the thin strokes that distinguish similar digits.
+    polarity. Uses _despeckle() (not morphological opening) to remove
+    surface-texture noise while preserving fine digit-stroke detail --
+    see FIX #11.
     """
     h, w = gray.shape[:2]
     denoised = denoise(gray, 3)
     binary = robust_binarize(denoised, polarity="border")
     if min(h, w) >= 15:
+        binary = _despeckle(binary)
         binary = clean_mask(binary, ksize=2, use_opening=False)
     return binary
 
@@ -314,7 +301,6 @@ def _get_components(binary: np.ndarray, min_area_frac: float = 0.0005,
 
 
 def _looks_like_digit(c: Component, min_aspect: float = 0.8, max_aspect: float = 6.0) -> bool:
-    """Real digits are reliably taller than wide (h/w roughly 1-6)."""
     if c.w <= 0 or c.h <= 0:
         return False
     aspect = c.h / c.w
@@ -322,7 +308,6 @@ def _looks_like_digit(c: Component, min_aspect: float = 0.8, max_aspect: float =
 
 
 def _group_score(group: List[Component]) -> float:
-    """Lower is more regular (consistent widths, even spacing)."""
     widths = np.array([c.w for c in group], dtype=np.float32)
     if widths.mean() <= 0:
         return float("inf")
@@ -349,12 +334,6 @@ def _group_is_regular(group: List[Component], tol: float = 0.35) -> bool:
 
 
 def _best_subset(group: List[Component], n_digits: int, max_search_extra: int = 6) -> List[Component]:
-    """
-    Picks the n_digits-sized subset of `group` that scores most regular.
-    Guards against a spurious extra component (dust speck, shadow) being
-    kept over a genuine digit. Falls back to a height-closeness heuristic
-    if there are too many extra candidates for exhaustive search.
-    """
     if len(group) <= n_digits:
         return group
     if len(group) - n_digits <= max_search_extra:
@@ -377,7 +356,6 @@ def _best_subset(group: List[Component], n_digits: int, max_search_extra: int = 
 
 def _row_band_and_extent(binary: np.ndarray, y0: Optional[int] = None,
                           y1: Optional[int] = None) -> Optional[Tuple[int, int, int, int]]:
-    """Last-resort localization used only when no digit-like component group is found at all."""
     h, w = binary.shape[:2]
 
     if y0 is None or y1 is None:
@@ -425,7 +403,7 @@ def _uniform_slice_boxes(extent: Tuple[int, int, int, int],
 def find_digit_row(gray: np.ndarray, n_digits: int = 7,
                     row_tolerance_frac: float = 0.4) -> Optional[List[Tuple[int, int, int, int]]]:
     corrected = correct_illumination(gray)
-    binary = clean_mask(robust_binarize(corrected))  # use_opening=True default: fine for coarse localization
+    binary = clean_mask(robust_binarize(corrected))
     binary_inv = clean_mask(cv2.bitwise_not(binary))
 
     comps = _get_components(binary) + _get_components(binary_inv)
@@ -496,11 +474,6 @@ def locate_digit_row_multi_orientation(bgr: np.ndarray,
 
 def extract_digit_crops(gray: np.ndarray, boxes: List[Tuple[int, int, int, int]],
                          pad_frac: float = 0.25) -> List[np.ndarray]:
-    """
-    Slices each digit's box out of the RAW GRAYSCALE full seal image (with
-    generous padding -- see FIX #10b) and binarizes each crop INDIVIDUALLY
-    via prepare_isolated_crop(), matching the training distribution.
-    """
     crops = []
     h_img, w_img = gray.shape[:2]
     for (x, y, w, h) in boxes:
