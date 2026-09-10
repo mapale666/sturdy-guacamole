@@ -3,76 +3,40 @@ preprocessing.py
 =================
 Shared preprocessing utilities for the seal numeral recognition task.
 
-Two distinct normalization paths are provided, and using the wrong one is
-a common source of silent failure:
+See prior revisions' fix history (kept brief here; the important recent
+ones are below).
 
-- correct_illumination() / robust_binarize() / clean_mask() -- designed
-  for FULL seal photos, where there's real background/vignetting context
-  for a large-kernel blur to estimate. Used by find_digit_row() to LOCATE
-  the digit row (connected-component analysis needs one consistent binary
-  mask of the whole photo). It is NOT used to produce the crops that are
-  fed to the classifier -- see extract_digit_crops() below.
+FIX #1-3: training/inference crop preprocessing mismatches (illumination
+kernel on tiny crops, area-based vs border-based polarity, global vs
+per-crop thresholding). All fixed in CharsDataset (model.py) and
+prepare_isolated_crop()/extract_digit_crops() here.
 
-- prepare_isolated_crop() -- designed for ALREADY-CROPPED individual
-  digit images (e.g. ground_truth_chars_balanced/100016_0.tif). These
-  crops are small and tightly framed around a single digit, so running
-  the full-image illumination-correction pipeline on them (with a 51px
-  background-blur kernel) can be larger than the crop itself, flattening
-  the digit into near-uniform gray and destroying the shape before
-  thresholding ever sees it. Use this path for training data, AND for
-  every individual digit crop pulled out of a full seal photo at
-  inference time (see extract_digit_crops()) -- both need the exact same
-  per-crop, locally-thresholded treatment to stay in the same visual
-  domain the CNN was trained on.
+FIX #4-7: find_digit_row() localization. Added width/spacing regularity
+scoring across ALL row candidates (not just the first match), and an
+aspect-ratio filter so wide/short structural features (molded tag edges,
+lettering baselines) aren't mistaken for digits.
 
-FIX #1 (illumination kernel): CharsDataset in model.py used to call
-correct_illumination()+robust_binarize()+clean_mask() on the tiny,
-tightly-cropped training images -- the full-photo pipeline, which
-flattens tiny crops. Training now uses prepare_isolated_crop() instead.
+FIX #8 (this revision -- single global polarity assumption): find_digit_row()
+only ever binarized the photo ONE way (numeral assumed to be the area-
+minority across the whole image). That works for a dark-digits-on-light-
+tag photo, but fails completely for a light-digits-on-dark-tag photo (e.g.
+a black "TESCO" tag with white lettering) -- there, the true digit strokes
+are literally the WRONG polarity relative to what the connected-component
+search is looking for, so zero valid digit-shaped components are ever
+found and the code falls back to the crude last-resort full-image slice.
+find_digit_row() now searches components in BOTH the binarized mask and
+its inverse, pooling candidates from whichever polarity actually contains
+the digit strokes for this particular photo.
 
-FIX #2 (polarity): robust_binarize()'s default polarity normalization
-(normalize_polarity()) assumes the numeral is a minority of the image's
-area (<50%). That's safe for full seal photos, but breaks for tightly-
-framed single-digit crops where a bold digit can cover more than half
-the crop. normalize_polarity_by_border() fixes this by sampling the
-crop's border (reliably background even in the tightest crop) instead.
-prepare_isolated_crop() uses this via polarity="border".
-
-FIX #3 (per-crop vs. global thresholding): extract_digit_crops() used to
-binarize the ENTIRE seal photo ONCE with a single global Otsu threshold,
-then just slice sub-rectangles out of that one global binary mask. That
-produced crops with systematically different-looking strokes than the
-per-crop, locally-thresholded training images. extract_digit_crops() now
-slices the RAW GRAYSCALE region for each box and binarizes each digit
-crop individually with prepare_isolated_crop(), matching training exactly.
-
-FIX #4 (unreliable component-based localization): find_digit_row() picked
-whichever n_digits connected components had matching row height (cy),
-with NO check on whether their widths/spacing actually look like n_digits
-separate, evenly-spaced characters. Fragmented/merged strokes could pass
-that check anyway. find_digit_row() now validates the selected group's
-width/spacing regularity (_group_is_regular) and falls back to profile-
-based row slicing when it fails.
-
-FIX #5 (fallback used the wrong y-band): the first fallback version
-searched for the row's vertical position by scanning ink density across
-the *entire* photo height, which picked up unrelated ink elsewhere and
-sliced the whole photo. Fixed by reusing the (even horizontally-
-irregular) component group's y-range as the row-band hint.
-
-FIX #6 (this revision -- x-extent still leaked to the full image width):
-even restricted to the correct narrow y-band, a 5%-of-max column-density
-threshold was still too permissive -- something spans near the full
-width within that band (reflections/embossing texture/a border line),
-so the "column profile" fallback kept picking x0=0, x1=full_width instead
-of the true digit region. Fix: stop re-deriving the x-extent from a pixel
-density profile at all when a component group already exists. Even
-though the group's *internal* 7-way split was wrong (fragmented/merged
-digits), its overall bounding box (leftmost to rightmost detected
-component) is still a reliable signal, because spurious fragmentation/
-merging happens *inside* the digit row, not outside it. The pixel-
-density-profile approach (_row_band_and_extent) is now only used as a
-last resort when NO component group was found at all.
+FIX #9 (this revision -- phantom component vs. missed real digit): when a
+row candidate has slightly MORE digit-shaped components than n_digits
+(e.g. a stray dust speck or shadow mark happens to be digit-sized/shaped),
+the previous "keep the n_digits closest to median height" heuristic could
+keep the phantom and drop a genuine digit whose height happened to differ
+slightly (e.g. a "4" with an open top). find_digit_row() now searches
+over subsets (small combinatorial search, cheap when only a few
+components are extra) and keeps whichever n_digits subset scores most
+regular overall, rather than a single greedy per-component heuristic.
 
 Public entry points typically called from main.py / model.py:
 
@@ -91,6 +55,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 from dataclasses import dataclass
+from itertools import combinations
 from typing import List, Optional, Tuple
 
 # --------------------------------------------------------------------------- #
@@ -117,15 +82,13 @@ def to_gray(bgr: np.ndarray) -> np.ndarray:
 def correct_illumination(gray: np.ndarray, blur_ksize: int = 51) -> np.ndarray:
     """
     Flattens vignetting / uneven exposure by dividing out a heavily blurred
-    version of the image (an estimate of the local background), then
-    re-normalizes contrast with CLAHE. Intended for full seal photos where
-    the blur kernel is small relative to the image. DO NOT use this on
-    small, already-cropped individual digit images -- see
-    prepare_isolated_crop() instead, which caps the kernel to the crop size.
+    version of the image, then re-normalizes contrast with CLAHE. Intended
+    for full seal photos. DO NOT use this on small, already-cropped
+    individual digit images -- see prepare_isolated_crop() instead.
     """
     h, w = gray.shape[:2]
     ksize = min(blur_ksize, max(3, min(h, w) - 1))
-    ksize = ksize | 1  # must be odd
+    ksize = ksize | 1
     background = cv2.GaussianBlur(gray, (ksize, ksize), 0)
     background = np.where(background == 0, 1, background)
     normalized = (gray.astype(np.float32) / background.astype(np.float32)) * 128.0
@@ -148,19 +111,16 @@ def denoise(gray: np.ndarray, ksize: int = 3) -> np.ndarray:
 
 def robust_binarize(gray: np.ndarray, polarity: str = "area") -> np.ndarray:
     """
-    Produces a binary image with numeral pixels = 255, background = 0,
-    regardless of source polarity or exposure. Tries Otsu first, falls
-    back to adaptive thresholding if the result looks degenerate.
+    Produces a binary image with numeral pixels = 255, background = 0.
+    Tries Otsu first, falls back to adaptive thresholding if degenerate.
 
-    polarity controls how foreground vs. background is decided:
-    - "area" (default): normalize_polarity() -- assumes the numeral is a
-      minority of the total image area. Correct for full seal photos
-      (find_digit_row), where there's plenty of background margin around
-      the digit row.
-    - "border": normalize_polarity_by_border() -- samples the image border
-      instead. Use this for already-cropped, tightly-framed single-digit
-      images (prepare_isolated_crop), where a bold digit can cover more
-      than half the crop's area and break the "area" assumption.
+    polarity:
+    - "area" (default): assumes the numeral is a minority of the total
+      image area. Correct for full seal photos on average, but see FIX #8
+      -- a single global choice can still be locally wrong for a specific
+      sub-region (e.g. a dark tag with light lettering).
+    - "border": samples the image border instead. Use for already-cropped,
+      tightly-framed single-digit images.
     """
     blurred = denoise(gray, 3)
     _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -183,7 +143,6 @@ def robust_binarize(gray: np.ndarray, polarity: str = "area") -> np.ndarray:
 
 
 def normalize_polarity(binary: np.ndarray) -> np.ndarray:
-    """Forces numeral = foreground = 255, assuming numeral occupies less area."""
     fg_ratio = np.count_nonzero(binary) / binary.size
     if fg_ratio > 0.5:
         binary = cv2.bitwise_not(binary)
@@ -191,14 +150,6 @@ def normalize_polarity(binary: np.ndarray) -> np.ndarray:
 
 
 def normalize_polarity_by_border(binary: np.ndarray, border_frac: float = 0.08) -> np.ndarray:
-    """
-    Forces numeral = foreground = 255 by sampling the image BORDER as the
-    background estimate, instead of assuming the foreground is a minority
-    of total pixels. Even in a tightly-framed digit crop, the outermost
-    border strip reliably belongs to the background -- unlike total area,
-    which a bold/thick digit can easily exceed 50% of. Use this for
-    prepare_isolated_crop(); use normalize_polarity() for full seal photos.
-    """
     h, w = binary.shape[:2]
     bx = max(1, int(round(w * border_frac)))
     by = max(1, int(round(h * border_frac)))
@@ -213,7 +164,6 @@ def normalize_polarity_by_border(binary: np.ndarray, border_frac: float = 0.08) 
 
     border_white_ratio = np.count_nonzero(border_pixels) / border_pixels.size
     if border_white_ratio > 0.5:
-        # Border is mostly white -> white is background -> flip so numeral is 255.
         binary = cv2.bitwise_not(binary)
     return binary
 
@@ -241,21 +191,10 @@ def clean_mask(binary: np.ndarray, ksize: int = 3) -> np.ndarray:
 def prepare_isolated_crop(gray: np.ndarray) -> np.ndarray:
     """
     Binarizes an already-isolated digit crop WITHOUT full-image illumination
-    correction, using its own LOCAL Otsu threshold. Use this for
-    ground_truth_chars_balanced training images AND for each individual
-    digit crop sliced out of a full seal photo at inference time -- NOT
-    correct_illumination()+robust_binarize()+clean_mask() on the whole
-    photo, since (a) that combo's background-blur kernel is tuned for
-    whole seal photos and can exceed the size of a tight digit crop,
-    flattening the digit before thresholding ever runs, and (b) a single
-    threshold computed from the WHOLE photo produces different-looking
-    strokes than one computed locally per digit, creating a domain shift
-    versus training.
-
-    Uses border-based polarity normalization (polarity="border") rather
-    than the area-based default, because a bold digit can fill more than
-    half of a tightly-framed crop and break the "numeral is a minority of
-    the area" assumption that normalize_polarity() relies on.
+    correction, using its own LOCAL Otsu threshold and border-based
+    polarity. This is polarity-agnostic per crop, so it correctly handles
+    BOTH dark-on-light and light-on-dark digit crops regardless of which
+    global polarity find_digit_row() used to locate the box.
     """
     h, w = gray.shape[:2]
     denoised = denoise(gray, 3)
@@ -351,45 +290,73 @@ def _get_components(binary: np.ndarray, min_area_frac: float = 0.0005,
     return comps
 
 
+def _looks_like_digit(c: Component, min_aspect: float = 0.8, max_aspect: float = 6.0) -> bool:
+    """Real digits are reliably taller than wide (h/w roughly 1-6)."""
+    if c.w <= 0 or c.h <= 0:
+        return False
+    aspect = c.h / c.w
+    return min_aspect <= aspect <= max_aspect
+
+
+def _group_score(group: List[Component]) -> float:
+    """Lower is more regular (consistent widths, even spacing)."""
+    widths = np.array([c.w for c in group], dtype=np.float32)
+    if widths.mean() <= 0:
+        return float("inf")
+    width_cv = float(widths.std() / widths.mean())
+
+    xs = np.sort(np.array([c.x for c in group], dtype=np.float32))
+    spacing = np.diff(xs)
+    spacing_cv = float(spacing.std() / spacing.mean()) if len(spacing) > 0 and spacing.mean() > 0 else 0.0
+
+    return width_cv + spacing_cv
+
+
 def _group_is_regular(group: List[Component], tol: float = 0.35) -> bool:
-    """
-    Sanity-checks a candidate group of n_digits components: real digit
-    characters in this fixed-width seal font should have similar widths
-    and roughly even horizontal spacing. Rejects groups where widths vary
-    wildly (merged/split strokes) or spacing is wildly uneven (missed or
-    duplicated digits), even though the group technically satisfied the
-    row-height/count criteria.
-    """
     if len(group) < 2:
         return True
     widths = np.array([c.w for c in group], dtype=np.float32)
     if widths.mean() <= 0:
         return False
     width_cv = float(widths.std() / widths.mean())
-
     xs = np.sort(np.array([c.x for c in group], dtype=np.float32))
     spacing = np.diff(xs)
-    if len(spacing) == 0 or spacing.mean() <= 0:
-        spacing_cv = 0.0
-    else:
-        spacing_cv = float(spacing.std() / spacing.mean())
-
+    spacing_cv = float(spacing.std() / spacing.mean()) if len(spacing) > 0 and spacing.mean() > 0 else 0.0
     return width_cv <= tol and spacing_cv <= tol
+
+
+def _best_subset(group: List[Component], n_digits: int, max_search_extra: int = 6) -> List[Component]:
+    """
+    Picks the n_digits-sized subset of `group` that scores most regular.
+    Guards against a spurious extra component (dust speck, shadow) being
+    kept over a genuine digit just because it happens to be closer to the
+    group's median height -- see FIX #9. Falls back to a height-closeness
+    heuristic if there are too many extra candidates for exhaustive search
+    to stay cheap.
+    """
+    if len(group) <= n_digits:
+        return group
+    if len(group) - n_digits <= max_search_extra:
+        best = None
+        best_score = float("inf")
+        for combo in combinations(group, n_digits):
+            combo_sorted = sorted(combo, key=lambda c: c.x)
+            score = _group_score(combo_sorted)
+            if score < best_score:
+                best_score = score
+                best = combo_sorted
+        return list(best)
+
+    heights = sorted(c.h for c in group)
+    ref_h = heights[len(heights) // 2]
+    trimmed = sorted(group, key=lambda c: abs(c.h - ref_h))[:n_digits]
+    trimmed.sort(key=lambda c: c.x)
+    return trimmed
 
 
 def _row_band_and_extent(binary: np.ndarray, y0: Optional[int] = None,
                           y1: Optional[int] = None) -> Optional[Tuple[int, int, int, int]]:
-    """
-    Last-resort localization used only when NO component group was found
-    at all: finds a row band via a row ink-density profile across the
-    whole image, then its horizontal extent via a column ink-density
-    profile within that band. (When a component group DOES exist, even an
-    irregular one, find_digit_row() uses its bounding box directly instead
-    of this -- see FIX #6 above -- because pixel-density profiles can be
-    thrown off by reflections/texture/border lines spanning much of the
-    photo's width.)
-    Returns (x0, y0, x1, y1), or None.
-    """
+    """Last-resort localization used only when no digit-like component group is found at all."""
     h, w = binary.shape[:2]
 
     if y0 is None or y1 is None:
@@ -424,7 +391,6 @@ def _row_band_and_extent(binary: np.ndarray, y0: Optional[int] = None,
 
 def _uniform_slice_boxes(extent: Tuple[int, int, int, int],
                           n_digits: int) -> List[Tuple[int, int, int, int]]:
-    """Splits a (x0, y0, x1, y1) row extent into n_digits equal-width boxes."""
     x0, y0, x1, y1 = extent
     seg_w = (x1 - x0) / n_digits
     boxes = []
@@ -438,41 +404,45 @@ def _uniform_slice_boxes(extent: Tuple[int, int, int, int],
 def find_digit_row(gray: np.ndarray, n_digits: int = 7,
                     row_tolerance_frac: float = 0.4) -> Optional[List[Tuple[int, int, int, int]]]:
     corrected = correct_illumination(gray)
-    binary = robust_binarize(corrected)
-    binary = clean_mask(binary)
+    binary = clean_mask(robust_binarize(corrected))
+    binary_inv = clean_mask(cv2.bitwise_not(binary))
 
-    comps = _get_components(binary)
+    # Pool digit-shaped candidates from BOTH polarities -- the true digit
+    # strokes might be the area-majority "foreground" OR "background" of
+    # the whole photo depending on whether the tag they sit on is light-
+    # on-dark or dark-on-light (see FIX #8).
+    comps = _get_components(binary) + _get_components(binary_inv)
+    comps = [c for c in comps if _looks_like_digit(c)]
+
     best_group = None
+    best_score = float("inf")
     if len(comps) >= n_digits:
         heights = sorted(c.h for c in comps)
         ref_h = heights[len(heights) // 2]
         row_tol = ref_h * row_tolerance_frac
 
         comps_sorted_by_y = sorted(comps, key=lambda c: c.cy)
+        seen_cy = set()
         for base in comps_sorted_by_y:
-            group = [c for c in comps if abs(c.cy - base.cy) <= row_tol]
-            if len(group) >= n_digits:
-                group.sort(key=lambda c: c.x)
-                group = sorted(group, key=lambda c: abs(c.h - ref_h))[:max(n_digits, len(group))]
-                group.sort(key=lambda c: c.x)
-                if best_group is None or len(group) < len(best_group) or len(group) == n_digits:
-                    best_group = group
-                if len(group) == n_digits:
-                    break
+            key = round(base.cy)
+            if key in seen_cy:
+                continue
+            seen_cy.add(key)
 
-        if best_group is not None and len(best_group) > n_digits:
-            best_group = sorted(best_group, key=lambda c: c.area, reverse=True)[:n_digits]
-            best_group.sort(key=lambda c: c.x)
+            group = [c for c in comps if abs(c.cy - base.cy) <= row_tol]
+            if len(group) < n_digits:
+                continue
+
+            trimmed = _best_subset(group, n_digits)
+            score = _group_score(trimmed)
+            if score < best_score:
+                best_score = score
+                best_group = trimmed
 
     if best_group is not None and _group_is_regular(best_group):
         return [(c.x, c.y, c.w, c.h) for c in best_group]
 
     if best_group is not None:
-        # The group's internal 7-way split was unreliable (fragmented or
-        # merged digit strokes), but its overall bounding box is still a
-        # good estimate of the true digit row's extent -- fragmentation/
-        # merging happens INSIDE the row, not outside it. Re-slice that
-        # bounding box evenly instead of trusting the individual boxes.
         xs0 = min(c.x for c in best_group)
         xs1 = max(c.x + c.w for c in best_group)
         ys0 = min(c.y for c in best_group)
@@ -484,7 +454,6 @@ def find_digit_row(gray: np.ndarray, n_digits: int = 7,
             min(binary.shape[1], xs1 + pad_x), min(binary.shape[0], ys1 + pad_y),
         )
     else:
-        # No component group at all -- last resort, scan the whole image.
         extent = _row_band_and_extent(binary)
 
     if extent is None:
@@ -510,14 +479,6 @@ def locate_digit_row_multi_orientation(bgr: np.ndarray,
 
 def extract_digit_crops(gray: np.ndarray, boxes: List[Tuple[int, int, int, int]],
                          pad_frac: float = 0.15) -> List[np.ndarray]:
-    """
-    Slices each digit's box out of the RAW GRAYSCALE full seal image (with
-    padding) and binarizes each crop INDIVIDUALLY via prepare_isolated_crop()
-    -- the same locally-thresholded, border-polarity path used for the
-    ground_truth_chars_balanced training images. `gray` here is the leveled
-    (rotation-corrected) grayscale image returned by
-    locate_digit_row_multi_orientation(), i.e. NOT yet binarized.
-    """
     crops = []
     h_img, w_img = gray.shape[:2]
     for (x, y, w, h) in boxes:
