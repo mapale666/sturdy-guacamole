@@ -218,7 +218,7 @@ def _get_components(binary: np.ndarray, min_area_frac: float = 0.0008,
 
 
 def _looks_like_digit(c: Component, min_aspect: float = 1.15, max_aspect: float = 6.0,
-                       min_fill_ratio: float = 0.15) -> bool:
+                      min_fill_ratio: float = 0.15) -> bool:
     if c.w <= 0 or c.h <= 0:
         return False
     aspect = c.h / c.w
@@ -226,6 +226,31 @@ def _looks_like_digit(c: Component, min_aspect: float = 1.15, max_aspect: float 
         return False
     fill_ratio = c.area / float(c.w * c.h)
     return fill_ratio >= min_fill_ratio
+
+def _looks_like_digit_in_tag(c: Component, tag_h: int, tag_w: int,
+                             min_aspect: float = 1.15, max_aspect: float = 6.0,
+                             min_fill_ratio: float = 0.15,
+                             max_rel_h: float = 0.40, min_rel_h: float = 0.05,
+                             max_rel_w: float = 0.30, min_rel_w: float = 0.03) -> bool:
+    # First apply the generic digit-shape checks.
+    if not _looks_like_digit(c, min_aspect=min_aspect,
+                             max_aspect=max_aspect,
+                             min_fill_ratio=min_fill_ratio):
+        return False
+    if tag_h <= 0 or tag_w <= 0:
+        return False
+
+    rel_h = c.h / float(tag_h)
+    rel_w = c.w / float(tag_w)
+
+    # Digits should be a modest fraction of tag height/width,
+    # not huge multi-line blobs or tiny specks.
+    if rel_h < min_rel_h or rel_h > max_rel_h:
+        return False
+    if rel_w < min_rel_w or rel_w > max_rel_w:
+        return False
+
+    return True
 
 
 def _bbox_overlap_frac(inner: Component, outer: Component) -> float:
@@ -560,25 +585,37 @@ def _try_interpolated_group(group: List[Component], n_digits: int,
 # --------------------------------------------------------------------------- #
 
 def _collect_tag_components(tag_crop: np.ndarray) -> Tuple[List[Component], np.ndarray, np.ndarray]:
-
     corrected = correct_illumination(tag_crop)
     binary_normal = clean_mask(robust_binarize(corrected, polarity="area"))
     binary_inverted = clean_mask(cv2.bitwise_not(robust_binarize(corrected, polarity="area")))
 
+    tag_h, tag_w = tag_crop.shape[:2]
+
+    def _digit_count(binary: np.ndarray) -> int:
+        return len([
+            c for c in _get_components(binary)
+            if _looks_like_digit_in_tag(c, tag_h, tag_w)
+        ])
+
+    # Low-contrast fallback: if both polarities see too few plausible digits,
+    # retry with an aggressive local threshold to recover faint ink.
+    if _digit_count(binary_normal) < 5 and _digit_count(binary_inverted) < 5:
+        aggressive = cv2.adaptiveThreshold(
+            corrected, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, blockSize=15, C=5
+        )
+        binary_normal = clean_mask(aggressive)
+        binary_inverted = clean_mask(cv2.bitwise_not(aggressive))
+
     pool: List[Component] = []
     for binary in (binary_normal, binary_inverted):
         comps = _get_components(binary)
-        comps = [c for c in comps if _looks_like_digit(c)]
+        comps = [c for c in comps if _looks_like_digit_in_tag(c, tag_h, tag_w)]
         comps = _remove_nested_components(comps)
         pool.extend(comps)
+
     return _dedupe_cross_polarity(pool), binary_normal, binary_inverted
 
-
-# --------------------------------------------------------------------------- #
-# Projection-profile valley splitter (Stage 3, tertiary fallback). Used
-# when even the merged cross-polarity pool can't cleanly separate
-# n_digits blobs -- typically because two digits are touching/merged.
-# --------------------------------------------------------------------------- #
 
 def _valley_split_row(row_binary: np.ndarray, n_digits: int) -> Optional[List[Tuple[int, int, int, int]]]:
 
@@ -630,8 +667,8 @@ def _valley_split_row(row_binary: np.ndarray, n_digits: int) -> Optional[List[Tu
 
 def _find_tag_bbox_attempt(blurred: np.ndarray, img_area: float,
                             low: int, high: int) -> Optional[Tuple[int, int, int, int]]:
+    h, w = blurred.shape[:2]
     edges = cv2.Canny(blurred, low, high)
-    # Bridge small gaps in a faint/blurry embossed border before dilating.
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
     edges = cv2.dilate(edges, np.ones((5, 5), np.uint8), iterations=2)
 
@@ -644,24 +681,28 @@ def _find_tag_bbox_attempt(blurred: np.ndarray, img_area: float,
         if area < img_area * 0.03 or area > img_area * 0.75:
             continue
         x, y, cw, ch = cv2.boundingRect(cnt)
-        # A bounding box covering most of the whole photo is the outer
-        # frame/vignette, never the actual raised tag plaque -- reject
-        # by AREA ratio (robust to aspect skew), not per-dimension.
         if (cw * ch) >= 0.65 * img_area:
+            print(f"[DEBUG reject-area] cw={cw} ch={ch} area_ratio={(cw*ch)/img_area:.3f}")
+            continue
+        if cw >= 0.95 * w and ch >= 0.95 * h:
+            print(f"[DEBUG reject-dims] cw={cw} ch={ch} w={w} h={h}")
             continue
         rect_area = cw * ch
         if rect_area <= 0:
             continue
         fill = area / rect_area
         if fill < 0.35:
+            print(f"[DEBUG reject-fill] cw={cw} ch={ch} fill={fill:.3f}")
             continue
         aspect = ch / cw if cw > 0 else 0
-        if not (0.4 <= aspect <= 3.0):
+        if not (0.4 <= aspect <= 2.0):
+            print(f"[DEBUG reject-aspect] cw={cw} ch={ch} aspect={aspect:.3f}")
             continue
         if area > best_area:
             best_area = area
             best_bbox = (x, y, x + cw, y + ch)
 
+    print(f"[DEBUG attempt result] low={low} high={high} best_bbox={best_bbox}")
     return best_bbox
 
 
@@ -786,8 +827,11 @@ def _locate_within_tag(gray: np.ndarray, n_digits: int) -> Optional[List[Tuple[i
             if not _row_is_plausible(row_y0, row_y1, tag_height):
                 continue
             row_binary = binary[row_y0:row_y1, :]
-
-            row_comps = [c for c in _get_components(row_binary) if _looks_like_digit(c)]
+            
+            row_comps = [
+                c for c in _get_components(row_binary)
+                if _looks_like_digit_in_tag(c, tag_height, binary.shape[1])
+            ]
             row_comps = _remove_nested_components(row_comps)
             row_group = _best_row_group(row_comps, n_digits, prefer_lowest=True)
             if row_group is not None:

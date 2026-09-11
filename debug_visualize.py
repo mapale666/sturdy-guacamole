@@ -34,9 +34,13 @@ def dump_candidate_components(gray: np.ndarray, n_digits: int = 7):
         pad_y = max(3, int(0.1 * (y1 - y0)))
         row_y0, row_y1 = max(0, y0 - pad_y), min(binary.shape[0], y1 + pad_y)
         row_binary = binary[row_y0:row_y1, :]
+        tag_h, tag_w = tag_crop.shape[:2]
 
         comps = pp._get_components(row_binary)
-        shape_filtered = [c for c in comps if pp._looks_like_digit(c)]
+        shape_filtered = [
+                c for c in comps
+                if pp._looks_like_digit_in_tag(c, tag_h, tag_w)
+            ]
         deduped = pp._remove_nested_components(shape_filtered)
         print(f"[{label}] lowest band -> {len(comps)} raw -> {len(shape_filtered)} shape-filtered "
               f"-> {len(deduped)} deduped components")
